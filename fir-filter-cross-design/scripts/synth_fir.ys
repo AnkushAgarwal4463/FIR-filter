@@ -1,0 +1,21 @@
+# FIR synthesis template. The runner replaces __LIB_FILE__ and output paths.
+read_verilog -sv rtl/fir_filter.v
+chparam -set DATA_WIDTH 8 -set COEFF_WIDTH 8 -set TAPS 8 -set ACC_WIDTH 24 fir_filter
+hierarchy -check -top fir_filter
+proc
+flatten
+opt
+fsm
+opt
+memory
+opt
+techmap
+opt
+dfflibmap -liberty "__LIB_FILE__"
+abc -liberty "__LIB_FILE__"
+opt
+clean
+check
+write_json fir_project/synth/fir_filter_netlist.json
+write_verilog -noattr fir_project/synth/fir_filter_netlist.v
+stat -liberty "__LIB_FILE__"

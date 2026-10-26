@@ -1,0 +1,6 @@
+# FIR timing constraints; __CLK_PERIOD__ is replaced by run_fir_flow.sh.
+create_clock -name core_clk -period __CLK_PERIOD__ [get_ports clk]
+set_input_delay 1.0 -clock core_clk [get_ports {rst valid_in sample_in[*]}]
+set_output_delay 1.0 -clock core_clk [get_ports {valid_out sample_out[*]}]
+set_input_transition 0.1 [get_ports {rst valid_in sample_in[*]}]
+set_load 0.01 [get_ports {valid_out sample_out[*]}]
