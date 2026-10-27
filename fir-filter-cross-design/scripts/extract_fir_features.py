@@ -1,27 +1,16 @@
 
 #!/usr/bin/env python3
 """
-Extract FIR-filter netlist features and physical-design targets.
+FIR filter feature and physical-target extractor.
 
-Flow:
-    Yosys JSON netlist
-        -> preplacement_features.csv / .json
+Outputs:
+  preplacement_features.csv / .json
+  physical_targets.csv / .json
+  features.csv / .json
+  fir_features.csv
+  extraction_status.json
 
-    OpenROAD run directory
-        -> physical_targets.csv / .json
-
-    Combined output
-        -> features.csv / .json
-
-Important:
-- Missing metrics remain null/empty; they are never silently set to zero.
-- Pre-placement predictors are kept separate from physical targets.
-- DEF routing counts are approximate structural counts, not exact
-  physical wire-segment counts.
-- Timing and congestion are extracted only when recognizable metrics
-  are found in the available reports/logs.
-- The presence of final.odb or final.def alone does not prove that
-  detailed routing completed successfully.
+Missing metrics remain null. No unverified values are fabricated.
 """
 
 from __future__ import annotations
@@ -32,41 +21,23 @@ import json
 import math
 import re
 import sys
-
 from collections import Counter
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Any
 
+NUM = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
 
-# ---------------------------------------------------------------------
-# Regular expressions
-# ---------------------------------------------------------------------
-
-NUM = (
-    r"[-+]?"
-    r"(?:\d+(?:\.\d*)?|\.\d+)"
-    r"(?:[eE][-+]?\d+)?"
-)
-
-# These patterns are heuristic cell-name classifiers.
-# For research-quality classification, use Liberty cell-function metadata
-# or a validated technology-specific cell map.
 SEQ_RE = re.compile(
-    r"(?:df|ed|sd|dfr|dfrtp|dfrbp|dfrtn|sdf|ff|latch|"
-    r"sky130_fd_sc_hd__df|sky130_fd_sc_hd__sd)",
-    re.IGNORECASE,
+    r"(?:sky130_fd_sc_hd__(?:df|sd|ed|sdf)|"
+    r"\b(?:dfrtp|dfrbp|dfrtn|dfr|dff|flipflop|latch)\b)",
+    re.I,
 )
-
-BUF_RE = re.compile(
-    r"(?:buf|inv|clkbuf)",
-    re.IGNORECASE,
-)
-
+BUF_RE = re.compile(r"(?:buf|inv|clkbuf)", re.I)
 COMB_RE = re.compile(
-    r"(?:and|or|xor|xnor|mux|maj|fa|ha|a[oi]i|o[ai]|"
-    r"nand|nor|add|sub|mul|alu|logic|cmp)",
-    re.IGNORECASE,
+    r"(?:and|or|xor|xnor|mux|maj|fa|ha|aoi|oai|nand|nor|"
+    r"add|sub|mul|alu|logic|cmp)",
+    re.I,
 )
 
 
@@ -75,200 +46,155 @@ COMB_RE = re.compile(
 # ---------------------------------------------------------------------
 
 def read_text(path: Path) -> str:
-    """Read a text file. Return an empty string if unavailable."""
     try:
         return path.read_text(encoding="utf-8", errors="ignore")
-    except (OSError, UnicodeError):
+    except OSError:
         return ""
 
 
 def finite_float(value: Any) -> float | None:
-    """Convert a value to a finite float; otherwise return None."""
     try:
-        result = float(value)
-        return result if math.isfinite(result) else None
+        value = float(value)
+        return value if math.isfinite(value) else None
     except (TypeError, ValueError, OverflowError):
         return None
 
 
-def json_safe(value: Any) -> Any:
-    """Recursively convert non-finite floats to JSON null."""
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-
-    if isinstance(value, dict):
-        return {str(k): json_safe(v) for k, v in value.items()}
-
-    if isinstance(value, (list, tuple)):
-        return [json_safe(v) for v in value]
-
-    return value
-
-
 def write_json(path: Path, data: dict[str, Any]) -> None:
-    """Write formatted JSON, converting non-finite floats to null."""
     with path.open("w", encoding="utf-8") as f:
-        json.dump(json_safe(data), f, indent=2, allow_nan=False)
+        json.dump(data, f, indent=2, allow_nan=False)
         f.write("\n")
 
 
 def write_csv(path: Path, data: dict[str, Any]) -> None:
-    """
-    Write a one-row CSV.
-    Nested dictionaries/lists are omitted from CSV but remain available
-    in the corresponding JSON output.
-    """
     flat = {
-        key: value
-        for key, value in data.items()
-        if not isinstance(value, (dict, list, tuple))
+        k: v for k, v in data.items()
+        if not isinstance(v, (dict, list, tuple))
     }
-
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(flat.keys()))
+        writer = csv.DictWriter(f, fieldnames=list(flat))
         writer.writeheader()
-        writer.writerow({
-            key: json_safe(value)
-            for key, value in flat.items()
-        })
+        writer.writerow(flat)
 
 
-def find_first_existing(
-    run_dir: Path,
-    candidates: list[str],
+def write_rows_csv(
+    path: Path,
+    fieldnames: list[str],
+    row: dict[str, Any],
+) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow({key: row.get(key) for key in fieldnames})
+
+
+def last_number(text: str, patterns: list[str]) -> float | None:
+    """Return the last value matching the first pattern that matches."""
+    for pattern in patterns:
+        matches = list(re.finditer(pattern, text, re.I | re.M))
+        for match in reversed(matches):
+            value = finite_float(match.group(1))
+            if value is not None:
+                return value
+    return None
+
+
+def first_existing_text(
+    directory: Path,
+    filenames: list[str],
 ) -> tuple[Path | None, str]:
-    """Return the first existing candidate file and its text."""
-    for filename in candidates:
-        path = run_dir / filename
+    for filename in filenames:
+        path = directory / filename
         if path.is_file():
-            content = read_text(path)
-            if content.strip():
-                return path, content
-
+            text = read_text(path)
+            if text.strip():
+                return path, text
     return None, ""
 
 
 # ---------------------------------------------------------------------
-# Netlist feature extraction
+# Netlist extraction
 # ---------------------------------------------------------------------
 
 def classify_cell(cell_type: str) -> str:
-    """
-    Classify a cell using name-based heuristics.
-
-    This is not a substitute for reading the actual Liberty function
-    or sequential-cell attributes.
-    """
     name = str(cell_type).lower().lstrip("\\")
-
     if SEQ_RE.search(name):
         return "sequential"
-
     if BUF_RE.search(name):
         return "buffer_inverter"
-
     if COMB_RE.search(name):
         return "combinational"
-
     return "other"
 
 
-def load_yosys_json(path: Path) -> dict[str, Any]:
-    """Load and validate the Yosys JSON file."""
+def load_netlist(path: Path) -> dict[str, Any]:
     if not path.is_file():
-        raise FileNotFoundError(f"Yosys JSON netlist not found: {path}")
+        raise FileNotFoundError(f"Netlist JSON not found: {path}")
 
     try:
-        design = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Invalid JSON netlist at {path}: {exc}"
-        ) from exc
+        raise ValueError(f"Invalid JSON netlist: {exc}") from exc
 
-    if not isinstance(design, dict):
-        raise ValueError("Yosys JSON root must be an object.")
+    if not isinstance(data, dict) or not isinstance(data.get("modules"), dict):
+        raise ValueError("Expected a Yosys JSON file containing 'modules'.")
 
-    if not isinstance(design.get("modules"), dict):
-        raise ValueError("Yosys JSON does not contain a valid 'modules' object.")
-
-    return design
+    return data
 
 
-def select_top_module(
+def select_top(
     modules: dict[str, Any],
     requested_top: str,
 ) -> str:
-    """Select the requested top, or use a detectable fallback."""
     if requested_top in modules:
         return requested_top
 
-    # Yosys top attributes can be represented as strings or bit strings.
     marked = []
-
     for name, module in modules.items():
-        attributes = module.get("attributes", {})
-        top_attr = str(attributes.get("top", "")).strip().strip("'")
-
-        if top_attr in ("1", "00000000000000000000000000000001"):
+        value = str(module.get("attributes", {}).get("top", "")).strip("'")
+        if value.lstrip("0") == "1":
             marked.append(name)
 
     if len(marked) == 1:
-        print(
-            f"WARNING: requested top '{requested_top}' was not found; "
-            f"using marked top '{marked[0]}'.",
-            file=sys.stderr,
-        )
+        print(f"WARNING: using detected top module {marked[0]}", file=sys.stderr)
         return marked[0]
 
     if len(modules) == 1:
-        only_module = next(iter(modules))
-        print(
-            f"WARNING: requested top '{requested_top}' was not found; "
-            f"using the only module '{only_module}'.",
-            file=sys.stderr,
-        )
-        return only_module
+        return next(iter(modules))
 
     raise ValueError(
-        f"Top module '{requested_top}' was not found. "
-        f"Available modules: {list(modules.keys())}"
+        f"Top '{requested_top}' not found. Available: {list(modules)}"
     )
 
 
-def netlist_features(
+def extract_netlist_features(
     path: Path,
     requested_top: str,
     design_id: str,
 ) -> dict[str, Any]:
-    """Extract structural features from a Yosys JSON netlist."""
-    design = load_yosys_json(path)
-    modules = design["modules"]
-
-    top = select_top_module(modules, requested_top)
-    module = modules[top]
+    design = load_netlist(path)
+    top = select_top(design["modules"], requested_top)
+    module = design["modules"][top]
 
     cells = module.get("cells", {})
     ports = module.get("ports", {})
     netnames = module.get("netnames", {})
 
     if not isinstance(cells, dict):
-        raise ValueError("The selected module has an invalid 'cells' object.")
+        raise ValueError("Invalid cells object in Yosys JSON.")
 
     cell_types = Counter(
-        str(cell.get("type", "unknown"))
-        for cell in cells.values()
+        str(cell.get("type", "unknown")) for cell in cells.values()
     )
-
     class_counts = Counter()
-
     for cell_type, count in cell_types.items():
         class_counts[classify_cell(cell_type)] += count
 
-    # Collect integer bit IDs from net names, ports, and cell connections.
-    # Constants in Yosys JSON are commonly represented as strings and
-    # are deliberately excluded from integer bit-ID fanout statistics.
+    # Use actual cell input-port directions to calculate logical fanout.
+    # If directions are missing, leave fanout null rather than inventing it.
     all_bits: set[int] = set()
-    bit_sinks: Counter[int] = Counter()
+    sink_counts: Counter[int] = Counter()
+    direction_metadata_found = False
 
     for net in netnames.values():
         for bit in net.get("bits", []):
@@ -284,30 +210,30 @@ def netlist_features(
         connections = cell.get("connections", {})
         directions = cell.get("port_directions", {})
 
+        if isinstance(directions, dict) and directions:
+            direction_metadata_found = True
+
         for port_name, bits in connections.items():
+            direction = str(directions.get(port_name, "")).lower()
+
             for bit in bits:
                 if isinstance(bit, int) and not isinstance(bit, bool):
                     all_bits.add(bit)
+                    if direction == "input":
+                        sink_counts[bit] += 1
 
-            # Only count sinks when the Yosys JSON explicitly identifies
-            # the connection as an input. Do not guess unknown directions.
-            if directions.get(port_name) == "input":
-                for bit in bits:
-                    if isinstance(bit, int) and not isinstance(bit, bool):
-                        bit_sinks[bit] += 1
+    fanouts = (
+        [sink_counts[b] for b in all_bits if sink_counts[b] > 0]
+        if direction_metadata_found
+        else []
+    )
 
-    # Fanout statistics include represented integer bits with at least
-    # one input sink. They are logical-netlist statistics, not routed
-    # physical fanout measurements.
-    fanouts = [
-        bit_sinks[bit]
-        for bit in all_bits
-        if bit_sinks[bit] > 0
-    ]
-
-    port_bit_count = sum(
-        len(port.get("bits", []))
-        for port in ports.values()
+    net_bit_total = sum(
+        sum(
+            isinstance(bit, int) and not isinstance(bit, bool)
+            for bit in net.get("bits", [])
+        )
+        for net in netnames.values()
     )
 
     return {
@@ -317,7 +243,7 @@ def netlist_features(
         "cell_count": len(cells),
         "netname_count": len(netnames),
         "port_count": len(ports),
-        "port_bit_count": port_bit_count,
+        "port_bit_count": sum(len(p.get("bits", [])) for p in ports.values()),
         "sequential_cell_count": class_counts["sequential"],
         "combinational_cell_count": class_counts["combinational"],
         "buffer_inverter_count": class_counts["buffer_inverter"],
@@ -326,17 +252,17 @@ def netlist_features(
         "avg_bit_fanout": mean(fanouts) if fanouts else None,
         "max_bit_fanout": max(fanouts) if fanouts else None,
         "std_bit_fanout": (
-            pstdev(fanouts)
-            if len(fanouts) > 1
-            else (0.0 if fanouts else None)
+            pstdev(fanouts) if len(fanouts) > 1
+            else 0.0 if fanouts
+            else None
         ),
-        "total_net_bits": sum(
-            len([
-                bit for bit in net.get("bits", [])
-                if isinstance(bit, int) and not isinstance(bit, bool)
-            ])
-            for net in netnames.values()
+        "fanout_direction_metadata_found": direction_metadata_found,
+        "fanout_method": (
+            "Yosys cell input-port directions"
+            if direction_metadata_found
+            else "unavailable: cell port directions missing"
         ),
+        "total_net_bits": net_bit_total,
         "unique_cell_types": dict(cell_types),
         "feature_stage": "post-synthesis / pre-placement",
         "cell_classification_method": "heuristic cell-name matching",
@@ -344,212 +270,248 @@ def netlist_features(
 
 
 # ---------------------------------------------------------------------
-# Report metric extraction
+# Timing extraction
 # ---------------------------------------------------------------------
 
-def parse_labeled_number(
-    text: str,
-    patterns: list[str],
-) -> float | None:
-    """
-    Extract a number only when a supplied label pattern matches.
-
-    No generic fallback to an arbitrary number is performed, to reduce
-    the chance of recording an unrelated timing or congestion value.
-    """
-    for pattern in patterns:
-        matches = re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
-
-        for match in matches:
-            value = finite_float(match.group(1))
-            if value is not None:
-                return value
-
-    return None
-
-
 def timing_patterns() -> dict[str, list[str]]:
-    """Known label patterns; actual report formats must be verified."""
+    # Supports summary formats such as:
+    #   worst slack max 1.57
+    #   worst slack: 1.57
+    #   wns max 1.57
+    #   tns max 0.00
+    #   worst slack min 0.47
     return {
         "wns_setup_ns": [
+            rf"\bworst\s+slack\s+max\s*[:=]?\s*({NUM})",
+            rf"\bwns\s+max\s*[:=]?\s*({NUM})",
             rf"\bworst\s+slack(?:\s*\([^)]*\))?\s*[:=]\s*({NUM})",
             rf"\bwns(?:\s*\([^)]*\))?\s*[:=]\s*({NUM})",
-            rf"\bworst\s+negative\s+slack\s*[:=]\s*({NUM})",
         ],
         "tns_setup_ns": [
-            rf"\btotal\s+negative\s+slack(?:\s*\([^)]*\))?\s*[:=]\s*({NUM})",
+            rf"\btotal\s+negative\s+slack\s*[:=]\s*({NUM})",
+            rf"\btns\s+max\s*[:=]?\s*({NUM})",
             rf"\btns(?:\s*\([^)]*\))?\s*[:=]\s*({NUM})",
+            rf"\btotal\s+negative\s+slack(?:\s*\([^)]*\))?\s*[:=]\s*({NUM})",
         ],
         "wns_hold_ns": [
+            rf"\bworst\s+slack\s+min\s*[:=]?\s*({NUM})",
+            rf"\bwns\s+min\s*[:=]?\s*({NUM})",
             rf"\bworst\s+slack(?:\s*\([^)]*\))?\s*[:=]\s*({NUM})",
             rf"\bwns(?:\s*\([^)]*\))?\s*[:=]\s*({NUM})",
-            rf"\bworst\s+negative\s+slack\s*[:=]\s*({NUM})",
         ],
     }
 
 
-def parse_def_routing(def_text: str) -> dict[str, Any]:
-    """
-    Extract approximate counts from the DEF NETS section.
+def parse_timing(text: str, metric: str) -> float | None:
+    return last_number(text, timing_patterns()[metric])
 
-    route_segment_count counts ROUTED/NEW routing clauses, not necessarily
-    individual geometric wire segments. DEF wildcard coordinates, vias,
-    special nets, and geometry semantics are not fully decoded here.
-    """
-    match = re.search(
+
+# ---------------------------------------------------------------------
+# DEF and routing-log extraction
+# ---------------------------------------------------------------------
+
+def parse_def_routing(def_text: str) -> dict[str, Any]:
+    section = re.search(
         r"\bNETS\s+\d+\s*;(.*?)\bEND\s+NETS\b",
         def_text,
-        flags=re.IGNORECASE | re.DOTALL,
+        re.I | re.S,
     )
 
-    if not match:
+    if not section:
         return {
             "def_nets_section_found": False,
             "routed_net_count": None,
             "route_segment_count": None,
         }
 
-    net_section = match.group(1)
-
-    # Split entries beginning with a DEF net-entry hyphen.
     entries = re.findall(
         r"(?ms)^[ \t]*-[ \t]+.*?;",
-        net_section,
+        section.group(1),
     )
 
-    routed_net_count = 0
-    route_clause_count = 0
+    routed_nets = 0
+    route_clauses = 0
 
     for entry in entries:
         clauses = re.findall(
-            r"\b(?:ROUTED|FIXED|COVER|NEW)\s+[A-Za-z0-9_.$/\[\]-]+",
+            r"\b(?:ROUTED|FIXED|COVER|NEW)\s+"
+            r"[A-Za-z0-9_.$/\[\]-]+",
             entry,
-            flags=re.IGNORECASE,
+            re.I,
         )
-
         if clauses:
-            routed_net_count += 1
+            routed_nets += 1
 
-        route_clause_count += len(re.findall(
+        route_clauses += len(re.findall(
             r"\b(?:ROUTED|NEW)\s+[A-Za-z0-9_.$/\[\]-]+",
             entry,
-            flags=re.IGNORECASE,
+            re.I,
         ))
 
     return {
         "def_nets_section_found": True,
-        "routed_net_count": routed_net_count,
-        "route_segment_count": route_clause_count,
+        "routed_net_count": routed_nets,
+        "route_segment_count": route_clauses,
+    }
+
+
+def parse_route_log(text: str) -> dict[str, Any]:
+    # Use the final occurrence because detailed routing logs can report
+    # intermediate iterations before the final routing summary.
+    wirelength = last_number(text, [
+        rf"\bTotal\s+wire\s+length\s*[:=]\s*({NUM})\s*(?:um|µm)\b",
+        rf"\bTotal\s+wire\s+length\s*[:=]\s*({NUM})",
+    ])
+
+    vias = last_number(text, [
+        rf"\bTotal\s+number\s+of\s+vias\s*[:=]\s*({NUM})",
+        rf"\bNumber\s+of\s+vias\s*[:=]\s*({NUM})",
+    ])
+
+    violations = last_number(text, [
+        rf"\bNumber\s+of\s+violations\s*[:=]\s*({NUM})",
+        rf"\bTotal\s+violations\s*[:=]\s*({NUM})",
+    ])
+
+    # OpenROAD sometimes reports the final summary as:
+    # "Number of violations = 0". Do not assume a zero merely because
+    # the log says detailed routing completed.
+    return {
+        "wirelength_um": wirelength,
+        "via_count": int(vias) if vias is not None else None,
+        "final_detailed_route_violations": (
+            int(violations) if violations is not None else None
+        ),
+    }
+
+
+def parse_congestion(text: str) -> float | None:
+    value = last_number(text, [
+        rf"\btotal\s+(?:routing\s+)?overflow\s*[:=]\s*({NUM})",
+        rf"\bcongestion\s+overflow\s*[:=]\s*({NUM})",
+        rf"\brouting\s+overflow\s*[:=]\s*({NUM})",
+    ])
+    if value is not None:
+        return value
+
+    if re.search(
+        r"\b(?:no overflowing gcells|no overflowing gcell|"
+        r"zero routing overflow)\b",
+        text,
+        re.I,
+    ):
+        return 0.0
+
+    return None
+
+
+def parse_physical_log_values(text: str) -> dict[str, Any]:
+    # Only populate these fields when a recognizable label is present.
+    effective_density = last_number(text, [
+        rf"\buniform density\s+to\s+({NUM})",
+        rf"\beffective\s+(?:placement\s+)?density\s*[:=]\s*({NUM})",
+    ])
+
+    design_area = last_number(text, [
+        rf"\bmovable instances area\s*[:=]?\s*({NUM})",
+        rf"\bdesign area\s*[:=]\s*({NUM})",
+    ])
+
+    return {
+        "effective_place_density": effective_density,
+        "design_area_um2": design_area,
     }
 
 
 # ---------------------------------------------------------------------
-# Physical-design targets
+# Physical target extraction
 # ---------------------------------------------------------------------
 
 def physical_features(run_dir: Path) -> dict[str, Any]:
-    """Extract available physical targets from an OpenROAD run directory."""
     if not run_dir.is_dir():
-        raise FileNotFoundError(
-            f"OpenROAD run directory not found: {run_dir}"
-        )
+        raise FileNotFoundError(f"Run directory not found: {run_dir}")
 
-    final_def_path = run_dir / "final.def"
-    final_odb_path = run_dir / "final.odb"
+    def_path = run_dir / "final.def"
+    odb_path = run_dir / "final.odb"
+    def_text = read_text(def_path)
 
-    def_text = read_text(final_def_path)
-
-    # Timing report candidates. These filenames are possibilities, not
-    # guarantees; the Tcl flow must generate the corresponding reports.
-    setup_path, setup_text = find_first_existing(run_dir, [
+    setup_path, setup_text = first_existing_text(run_dir, [
+        "wns_setup.rpt",
+        "wns_setup_global_route.rpt",
         "timing_setup.rpt",
         "timing_setup_global_route.rpt",
         "setup_timing.rpt",
         "setup.rpt",
     ])
 
-    hold_path, hold_text = find_first_existing(run_dir, [
+    tns_path, tns_text = first_existing_text(run_dir, [
+        "tns_setup.rpt",
+        "tns_setup_global_route.rpt",
+        "timing_setup.rpt",
+        "timing_setup_global_route.rpt",
+        "setup_timing.rpt",
+        "setup.rpt",
+    ])
+
+    hold_path, hold_text = first_existing_text(run_dir, [
+        "wns_hold.rpt",
         "timing_hold.rpt",
+        "wns_hold_global_route.rpt",
         "timing_hold_global_route.rpt",
         "hold_timing.rpt",
         "hold.rpt",
     ])
 
-    congestion_path, congestion_text = find_first_existing(run_dir, [
+    congestion_path, congestion_text = first_existing_text(run_dir, [
         "congestion.rpt",
         "global_route_congestion.rpt",
         "routing_congestion.rpt",
         "grt_congestion.rpt",
     ])
 
-    # Logs may contain summary metrics when separate reports are absent.
-    log_candidates = [
+    log_names = [
+        "5_2_route.log",
+        "detailed_route.log",
         "openroad_log.txt",
         "flow_diagnostics.log",
         "5_1_grt.log",
-        "5_2_route.log",
         "global_route.log",
-        "detailed_route.log",
     ]
 
-    log_texts = {}
-    for filename in log_candidates:
-        path = run_dir / filename
-        if path.is_file():
-            content = read_text(path)
-            if content.strip():
-                log_texts[filename] = content
+    logs: dict[str, str] = {}
+    for name in log_names:
+        text = read_text(run_dir / name)
+        if text.strip():
+            logs[name] = text
 
-    all_log_text = "\n".join(log_texts.values())
-
-    setup_source = setup_text or all_log_text
-    hold_source = hold_text or all_log_text
-    congestion_source = congestion_text or all_log_text
-
-    patterns = timing_patterns()
-
-    wns_setup = parse_labeled_number(
-        setup_source,
-        patterns["wns_setup_ns"],
+    # Prefer a detailed-routing-specific log; otherwise use the full log.
+    route_log_name = next(
+        (name for name in (
+            "5_2_route.log",
+            "detailed_route.log",
+            "openroad_log.txt",
+            "flow_diagnostics.log",
+        ) if name in logs),
+        None,
     )
+    route_text = logs.get(route_log_name, "")
 
-    tns_setup = parse_labeled_number(
-        setup_source,
-        patterns["tns_setup_ns"],
-    )
+    all_logs = "\n".join(logs.values())
 
-    wns_hold = parse_labeled_number(
-        hold_source,
-        patterns["wns_hold_ns"],
-    )
+    # If a dedicated report is absent, search the combined logs.
+    setup_source = setup_text or all_logs
+    tns_source = tns_text or all_logs
+    hold_source = hold_text or all_logs
+    congestion_source = congestion_text or all_logs
 
-    # Do not parse arbitrary numbers from routing reports. Only accept
-    # recognizable overflow labels or an explicit zero-overflow message.
-    congestion_overflow = parse_labeled_number(
-        congestion_source,
-        [
-            rf"\btotal\s+(?:routing\s+)?overflow\s*[:=]\s*({NUM})",
-            rf"\b(?:routing\s+)?overflow\s*[:=]\s*({NUM})",
-            rf"\bcongestion\s+overflow\s*[:=]\s*({NUM})",
-        ],
-    )
+    wns_setup = parse_timing(setup_source, "wns_setup_ns")
+    tns_setup = parse_timing(tns_source, "tns_setup_ns")
+    wns_hold = parse_timing(hold_source, "wns_hold_ns")
 
-    if congestion_overflow is None:
-        zero_overflow_patterns = [
-            r"\bno\s+overflowing\s+gcell(?:s)?\b",
-            r"\bzero\s+routing\s+overflow\b",
-            r"\btotal\s+(?:routing\s+)?overflow\s*[:=]\s*0+(?:\.0+)?\b",
-        ]
-
-        if any(
-            re.search(
-                pattern,
-                congestion_source,
-                flags=re.IGNORECASE,
-            )
-            for pattern in zero_overflow_patterns
-        ):
-            congestion_overflow = 0.0
+    # Routing log metrics are preferred over unrelated placement summaries.
+    route_metrics = parse_route_log(route_text)
+    congestion_overflow = parse_congestion(congestion_source)
+    physical_log_values = parse_physical_log_values(all_logs)
 
     def_counts = parse_def_routing(def_text) if def_text else {
         "def_nets_section_found": False,
@@ -557,233 +519,270 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "route_segment_count": None,
     }
 
-    # This extractor intentionally does not claim a wirelength measurement.
-    # A reliable value needs a validated OpenROAD report or a DEF geometry
-    # parser that handles database units and route geometry correctly.
-    wirelength_um = None
+    detailed_route_success = bool(re.search(
+        r"SUCCESS:\s*Detailed routing|Complete detail routing",
+        route_text,
+        re.I,
+    ))
 
-    # Artifact existence is reported separately from flow completion.
-    artifacts_present = final_def_path.is_file() and final_odb_path.is_file()
+    artifacts_present = (
+        def_path.is_file()
+        and odb_path.is_file()
+        and bool(def_text.strip())
+    )
 
     return {
-        "final_def_available": final_def_path.is_file(),
-        "final_odb_available": final_odb_path.is_file(),
+        "final_def_available": def_path.is_file(),
+        "final_odb_available": odb_path.is_file(),
         "final_def_nonempty": bool(def_text.strip()),
         "artifacts_present": artifacts_present,
+        "detailed_route_success_marker_found": detailed_route_success,
         **def_counts,
+        **route_metrics,
+        **physical_log_values,
         "wns_setup_ns": wns_setup,
         "tns_setup_ns": tns_setup,
         "wns_hold_ns": wns_hold,
         "congestion_overflow": congestion_overflow,
-        "wirelength_um": wirelength_um,
         "setup_report_source": (
             str(setup_path) if setup_path else (
-                "logs" if not setup_text and all_log_text else None
+                "logs" if setup_source else None
+            )
+        ),
+        "tns_report_source": (
+            str(tns_path) if tns_path else (
+                "logs" if tns_source else None
             )
         ),
         "hold_report_source": (
             str(hold_path) if hold_path else (
-                "logs" if not hold_text and all_log_text else None
+                "logs" if hold_source else None
             )
         ),
         "congestion_report_source": (
             str(congestion_path) if congestion_path else (
-                "logs" if not congestion_text and all_log_text else None
+                "logs" if congestion_source else None
             )
         ),
-        "log_files_found": list(log_texts.keys()),
+        "routing_log_source": route_log_name,
+        "log_files_found": list(logs),
         "target_measurement_status": {
             "wns_setup_ns": "measured" if wns_setup is not None else "unavailable",
             "tns_setup_ns": "measured" if tns_setup is not None else "unavailable",
             "wns_hold_ns": "measured" if wns_hold is not None else "unavailable",
-            "congestion_overflow": (
+            "congestion_overflow": "measured" if congestion_overflow is not None else "unavailable",
+            "wirelength_um": "measured" if route_metrics["wirelength_um"] is not None else "unavailable",
+            "via_count": "measured" if route_metrics["via_count"] is not None else "unavailable",
+            "final_detailed_route_violations": (
                 "measured"
-                if congestion_overflow is not None
+                if route_metrics["final_detailed_route_violations"] is not None
                 else "unavailable"
             ),
-            "wirelength_um": "unavailable_not_implemented",
+            "design_area_um2": (
+                "measured"
+                if physical_log_values["design_area_um2"] is not None
+                else "unavailable"
+            ),
         },
         "note": (
-            "Routing counts are approximate DEF clause counts. "
-            "Timing and congestion values are populated only when a "
-            "recognized metric label is found. Artifact existence alone "
-            "does not prove successful detailed routing. "
-            "wirelength_um remains null until measured with a validated "
-            "OpenROAD report or DEF geometry parser."
+            "DEF routing counts are approximate clause counts. "
+            "Fanout is based on Yosys cell input directions when available. "
+            "Routing log values use the last matching summary in the selected "
+            "routing log. A zero router violation count is not independent "
+            "signoff DRC verification. Congestion is null unless a recognized "
+            "overflow metric is found."
         ),
         "target_feature_stage": (
-            "post-placement/routing targets; do not use as predictors "
-            "when predicting these same outcomes"
+            "post-placement/routing targets; exclude these outcomes from "
+            "predictors when predicting the same outcomes"
         ),
     }
 
 
 # ---------------------------------------------------------------------
-# Combined output and command-line interface
+# Configuration CSV
+# ---------------------------------------------------------------------
+
+def write_configuration_csv(
+    outdir: Path,
+    run_dir: Path,
+    args: argparse.Namespace,
+) -> None:
+    """
+    Populate fir_features.csv with a configuration row.
+
+    Supply the design parameters explicitly on the command line.
+    Unknown parameters remain blank instead of being guessed.
+    """
+    run_id = args.run_id or run_dir.name
+
+    flow_status = args.flow_status or "unknown"
+    last_stage = "unknown"
+
+    logs = "\n".join(
+        read_text(run_dir / name)
+        for name in (
+            "openroad_log.txt",
+            "flow_diagnostics.log",
+            "5_2_route.log",
+            "detailed_route.log",
+        )
+    )
+
+    if re.search(r"SUCCESS:\s*Detailed routing|Complete detail routing", logs, re.I):
+        flow_status = args.flow_status or "detailed_routing_completed"
+        last_stage = "detailed_routing"
+    elif re.search(r"global placement", logs, re.I):
+        last_stage = "global_placement"
+
+    fields = [
+        "run_id", "taps", "data_width", "coeff_width", "acc_width",
+        "utilization", "place_density", "clk_period_ns",
+        "flow_status", "last_completed_stage",
+    ]
+
+    row = {
+        "run_id": run_id,
+        "taps": args.taps,
+        "data_width": args.data_width,
+        "coeff_width": args.coeff_width,
+        "acc_width": args.acc_width,
+        "utilization": args.utilization,
+        "place_density": args.place_density,
+        "clk_period_ns": args.clock_period,
+        "flow_status": flow_status,
+        "last_completed_stage": last_stage,
+    }
+
+    write_rows_csv(outdir / "fir_features.csv", fields, row)
+
+
+# ---------------------------------------------------------------------
+# Main
 # ---------------------------------------------------------------------
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description=(
-            "Extract FIR netlist features and physical-design targets "
-            "from Yosys JSON and an OpenROAD run directory."
-        )
+        description="Extract FIR netlist features and OpenROAD physical targets."
     )
 
     parser.add_argument(
         "--netlist-json",
         default="fir_project/synth/fir_filter_netlist.json",
-        help="Path to the synthesized Yosys JSON netlist.",
     )
-
     parser.add_argument(
         "--run-dir",
         default="fir_project/runs/fir_8tap_w8_util40_clk10",
-        help="Path to the specific OpenROAD run directory.",
     )
+    parser.add_argument("--outdir", default=None)
+    parser.add_argument("--top", default="fir_filter")
+    parser.add_argument("--design-id", default="fir_filter_8tap")
+    parser.add_argument("--run-id", default=None)
 
-    parser.add_argument(
-        "--outdir",
-        default=None,
-        help="Output directory. Defaults to --run-dir.",
-    )
-
-    parser.add_argument(
-        "--top",
-        default="fir_filter",
-        help="Top-module name in the Yosys JSON netlist.",
-    )
-
-    parser.add_argument(
-        "--design-id",
-        default="fir_filter_8tap",
-        help="Identifier written to the feature files.",
-    )
-
-    parser.add_argument(
-        "--utilization",
-        type=float,
-        default=None,
-        help="Utilization constraint in percent, e.g. 40.",
-    )
-
-    parser.add_argument(
-        "--clock-period",
-        type=float,
-        default=None,
-        help="Clock period in nanoseconds, e.g. 10.0.",
-    )
+    parser.add_argument("--taps", type=int, default=None)
+    parser.add_argument("--data-width", type=int, default=None)
+    parser.add_argument("--coeff-width", type=int, default=None)
+    parser.add_argument("--acc-width", type=int, default=None)
+    parser.add_argument("--utilization", type=float, default=None)
+    parser.add_argument("--place-density", type=float, default=None)
+    parser.add_argument("--clock-period", type=float, default=None)
+    parser.add_argument("--flow-status", default=None)
 
     args = parser.parse_args()
 
-    netlist_path = Path(args.netlist_json)
     run_dir = Path(args.run_dir)
     outdir = Path(args.outdir) if args.outdir else run_dir
+    netlist_path = Path(args.netlist_json)
 
-    if args.utilization is not None:
-        if not math.isfinite(args.utilization) or not (
-            0.0 < args.utilization <= 100.0
-        ):
-            parser.error("--utilization must be greater than 0 and at most 100.")
+    if args.utilization is not None and not (0 < args.utilization <= 100):
+        parser.error("--utilization must be > 0 and <= 100.")
 
-    if args.clock_period is not None:
-        if not math.isfinite(args.clock_period) or args.clock_period <= 0:
-            parser.error("--clock-period must be a positive finite number.")
+    if args.place_density is not None and not (0 < args.place_density <= 1):
+        parser.error("--place-density must be > 0 and <= 1.")
+
+    if args.clock_period is not None and args.clock_period <= 0:
+        parser.error("--clock-period must be positive.")
+
+    for name in ("taps", "data_width", "coeff_width", "acc_width"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive.")
 
     try:
         outdir.mkdir(parents=True, exist_ok=True)
 
-        pre = netlist_features(
-            path=netlist_path,
-            requested_top=args.top,
-            design_id=args.design_id,
+        pre = extract_netlist_features(
+            netlist_path,
+            args.top,
+            args.design_id,
         )
-
         pre["utilization_constraint_percent"] = args.utilization
         pre["clock_period_ns"] = args.clock_period
 
         post = physical_features(run_dir)
 
-        # Save predictor and target datasets separately.
         write_json(outdir / "preplacement_features.json", pre)
         write_csv(outdir / "preplacement_features.csv", pre)
 
         write_json(outdir / "physical_targets.json", post)
         write_csv(outdir / "physical_targets.csv", post)
 
-        # Keep the pre-placement feature_stage field intact in the
-        # combined CSV; target stage has its own explicit field.
         combined = {**pre, **post}
-
         write_json(outdir / "features.json", combined)
         write_csv(outdir / "features.csv", combined)
 
-        # Also provide a small extraction status file for automation.
+        write_configuration_csv(outdir, run_dir, args)
+
         status = {
             "design_id": args.design_id,
+            "run_id": args.run_id or run_dir.name,
             "netlist_json": str(netlist_path),
             "run_dir": str(run_dir),
             "output_dir": str(outdir),
+            "fanout_direction_metadata_found": pre["fanout_direction_metadata_found"],
             "final_def_available": post["final_def_available"],
             "final_odb_available": post["final_odb_available"],
             "artifacts_present": post["artifacts_present"],
+            "detailed_route_success_marker_found": post["detailed_route_success_marker_found"],
             "target_measurement_status": post["target_measurement_status"],
         }
-
         write_json(outdir / "extraction_status.json", status)
 
-    except (OSError, ValueError, FileNotFoundError) as exc:
+    except (OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
     print("\n===== FIR Feature Extraction =====")
-    print(f"Netlist JSON : {netlist_path}")
-    print(f"OpenROAD run : {run_dir}")
-    print(f"Output dir   : {outdir}")
-    print(f"Cells        : {pre['cell_count']}")
-    print(f"Sequential   : {pre['sequential_cell_count']}")
-    print(f"Combinational: {pre['combinational_cell_count']}")
-    print(f"DEF available: {post['final_def_available']}")
-    print(f"ODB available: {post['final_odb_available']}")
-    print(f"Artifacts present: {post['artifacts_present']}")
+    print(f"Run directory : {run_dir}")
+    print(f"Output directory: {outdir}")
+    print(f"Cell count    : {pre['cell_count']}")
+    print(f"Sequential    : {pre['sequential_cell_count']}")
+    print(f"Combinational : {pre['combinational_cell_count']}")
+    print(f"Fanout method : {pre['fanout_method']}")
+    print(f"Final DEF     : {post['final_def_available']}")
+    print(f"Final ODB     : {post['final_odb_available']}")
+    print(f"Routing success marker: {post['detailed_route_success_marker_found']}")
 
-    print("\n===== Extracted Physical Targets =====")
+    print("\n===== Physical Targets =====")
     for key in (
         "wns_setup_ns",
         "tns_setup_ns",
         "wns_hold_ns",
         "congestion_overflow",
         "wirelength_um",
+        "via_count",
+        "final_detailed_route_violations",
+        "design_area_um2",
+        "effective_place_density",
     ):
         print(f"{key}: {post.get(key)}")
 
-    print("\n===== Generated Files =====")
-    for filename in (
-        "preplacement_features.csv",
-        "preplacement_features.json",
-        "physical_targets.csv",
-        "physical_targets.json",
-        "features.csv",
-        "features.json",
-        "extraction_status.json",
-    ):
-        print(f"  {outdir / filename}")
+    print("\n===== Target Status =====")
+    for key, value in post["target_measurement_status"].items():
+        print(f"{key}: {value}")
 
-    unavailable = [
-        key
-        for key, value in post["target_measurement_status"].items()
-        if value != "measured"
-    ]
-
-    if unavailable:
-        print(
-            "\nWARNING: Some physical targets remain unavailable: "
-            + ", ".join(unavailable)
-        )
-        print(
-            "Inspect the actual OpenROAD reports/logs and validate the "
-            "metric formats before using these targets for ML training."
-        )
+    print("\nGenerated: preplacement_features.csv, physical_targets.csv,")
+    print("           features.csv, fir_features.csv, extraction_status.json")
 
     print("\nExtraction finished.")
     return 0
