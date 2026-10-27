@@ -48,6 +48,10 @@ jobs:
   fir-physical-design:
     runs-on: ubuntu-latest
 
+    # Provides OpenROAD and the ORFS platform files, including Sky130HD.
+    container:
+      image: openroad/orfs:latest
+
     defaults:
       run:
         working-directory: fir-filter-cross-design
@@ -69,9 +73,10 @@ jobs:
           echo "Project directory: $PWD"
           ls -la
 
-          echo "Checking environment.yml in repository root..."
-          test -f ../environment.yml
-          echo "FOUND: environment.yml"
+          test -f ../environment.yml || {
+            echo "ERROR: environment.yml missing from repository root."
+            exit 1
+          }
 
           files=(
             "Makefile"
@@ -86,6 +91,7 @@ jobs:
           )
 
           missing=0
+
           for file in "${files[@]}"; do
             if [[ -f "$file" ]]; then
               echo "FOUND: $file"
@@ -100,22 +106,24 @@ jobs:
             exit 1
           fi
 
-          echo "SUCCESS: All required files were found."
+          echo "All required project files were found."
 
       - name: Set up Python, Yosys, and Icarus Verilog
         uses: mamba-org/setup-micromamba@v2
         with:
-          environment-file: environment.yml
+          environment-file: ${{ github.workspace }}/environment.yml
           environment-name: fir-pd-flow
           cache-environment: true
           init-shell: bash
           post-cleanup: none
 
-      - name: Diagnose Conda environment
+      - name: Verify OpenROAD and synthesis tools
         run: |
           set -euo pipefail
 
-          echo "CONDA_PREFIX=${CONDA_PREFIX:-unset}"
+          # Load the tool paths provided by the ORFS container.
+          source /OpenROAD-flow-scripts/env.sh
+
           echo "Python:"
           command -v python
           python --version
@@ -128,39 +136,70 @@ jobs:
           command -v iverilog
           iverilog -V 2>&1 | head -n 2
 
-      - name: Verify OpenROAD
-        run: |
-          set -euo pipefail
-
-          if ! command -v openroad >/dev/null 2>&1; then
-            echo "ERROR: OpenROAD is not installed or is not on PATH."
-            exit 1
-          fi
-
+          echo "OpenROAD:"
+          command -v openroad
           openroad -version
 
-      - name: Verify Sky130A PDK configuration
+      - name: Configure and verify Sky130HD PDK
         run: |
           set -euo pipefail
 
-          source config/sky130_example.env
+          source /OpenROAD-flow-scripts/env.sh
 
-          for file in "$LIBERTY" "$CELL_LEF" "$TECH_LEF"; do
+          ORFS_PLATFORM="/OpenROAD-flow-scripts/flow/platforms/sky130hd"
+
+          LIBERTY_PATH="$ORFS_PLATFORM/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"
+          TECH_LEF_PATH="$ORFS_PLATFORM/lef/sky130_fd_sc_hd.tlef"
+          CELL_LEF_PATH="$ORFS_PLATFORM/lef/sky130_fd_sc_hd_merged.lef"
+
+          for file in \
+            "$LIBERTY_PATH" \
+            "$TECH_LEF_PATH" \
+            "$CELL_LEF_PATH"; do
             if [[ ! -f "$file" ]]; then
-              echo "ERROR: Required PDK file not found: $file"
+              echo "ERROR: Expected ORFS Sky130HD file not found: $file"
+              echo "Available platform files:"
+              find "$ORFS_PLATFORM" -maxdepth 3 -type f \
+                \( -name "*.lib" -o -name "*.lef" \) \
+                -print 2>/dev/null | sort || true
               exit 1
             fi
             echo "FOUND: $file"
           done
 
-          echo "Sky130A PDK files verified."
+          # Update the project configuration to use the verified
+          # files supplied by the ORFS container.
+          sed -i -E \
+            "s|^export LIBERTY=.*|export LIBERTY=\"$LIBERTY_PATH\"|" \
+            config/sky130_example.env
+
+          sed -i -E \
+            "s|^export TECH_LEF=.*|export TECH_LEF=\"$TECH_LEF_PATH\"|" \
+            config/sky130_example.env
+
+          sed -i -E \
+            "s|^export CELL_LEF=.*|export CELL_LEF=\"$CELL_LEF_PATH\"|" \
+            config/sky130_example.env
+
+          # Check that the updated project configuration resolves correctly.
+          source config/sky130_example.env
+
+          test -f "$LIBERTY"
+          test -f "$TECH_LEF"
+          test -f "$CELL_LEF"
+
+          echo "Sky130HD PDK paths configured and verified."
 
       - name: Run RTL simulation
-        run: make sim
+        run: |
+          set -euo pipefail
+          make sim
 
       - name: Run FIR synthesis and physical design
         run: |
           set -euo pipefail
+
+          source /OpenROAD-flow-scripts/env.sh
 
           export RUN_TAG="fir_8tap_w8_util${UTIL}_clk${CLK_PERIOD}"
           export RUN_DIR="fir_project/runs/${RUN_TAG}"
@@ -171,7 +210,8 @@ jobs:
       - name: List generated outputs
         if: always()
         run: |
-          echo "===== Generated project outputs ====="
+          echo "===== Generated FIR outputs ====="
+
           if [[ -d fir_project ]]; then
             find fir_project -maxdepth 6 -type f -print | sort
           else
