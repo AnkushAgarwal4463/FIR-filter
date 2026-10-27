@@ -1,0 +1,124 @@
+name: FIR Synthesis and Physical Design
+
+on:
+  workflow_dispatch:
+    inputs:
+      utilization:
+        description: "Target floorplan utilization (%)"
+        required: true
+        default: "40"
+      clock_period:
+        description: "Clock period (ns)"
+        required: true
+        default: "10.0"
+
+  push:
+    paths:
+      - "rtl/**"
+      - "tb/**"
+      - "scripts/**"
+      - "constraints/**"
+      - "config/**"
+      - "environment.yml"
+      - ".github/workflows/fir-physical-design.yml"
+
+  pull_request:
+    paths:
+      - "rtl/**"
+      - "tb/**"
+      - "scripts/**"
+      - "constraints/**"
+      - "config/**"
+      - "environment.yml"
+      - ".github/workflows/fir-physical-design.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fir-pd-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fir-physical-design:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    env:
+      UTIL: ${{ inputs.utilization || '40' }}
+      CLK_PERIOD: ${{ inputs.clock_period || '10.0' }}
+      PLACE_DENSITY: "0.40"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Yosys, OpenROAD, Icarus Verilog, and Sky130A
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          environment-name: fir-pd-flow
+          cache-environment: true
+          init-shell: bash
+          post-cleanup: all
+
+      - name: Print tool versions and verify PDK files
+        run: |
+          set -euo pipefail
+
+          command -v yosys
+          command -v openroad
+          command -v iverilog
+
+          yosys -V
+          openroad -version
+          iverilog -V 2>&1 | head -n 2
+
+          export PDK_ROOT="${CONDA_PREFIX}/share/pdk/sky130A"
+
+          test -f "$PDK_ROOT/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_5v00.lib"
+          test -f "$PDK_ROOT/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef"
+          test -f "$PDK_ROOT/libs.tech/lef/sky130_fd_sc_hd.tlef"
+
+      - name: Run RTL simulation
+        run: make sim
+
+      - name: Run FIR synthesis, placement, timing, and routing
+        run: |
+          set -euo pipefail
+
+          export RUN_TAG="fir_8tap_w8_util${UTIL}_clk${CLK_PERIOD}"
+
+          echo "Utilization: ${UTIL}%"
+          echo "Clock period: ${CLK_PERIOD} ns"
+          echo "Run tag: ${RUN_TAG}"
+
+          ./scripts/run_fir_flow.sh
+
+      - name: Check expected outputs
+        if: always()
+        run: |
+          echo "===== FIR run files ====="
+
+          find fir_project -maxdepth 5 -type f -print 2>/dev/null | sort || true
+
+          RUN_TAG="fir_8tap_w8_util${UTIL}_clk${CLK_PERIOD}"
+          RUN_DIR="fir_project/runs/${RUN_TAG}"
+
+          test -s "$RUN_DIR/openroad_log.txt" || true
+          test -s "$RUN_DIR/features.json" || true
+
+      - name: Upload FIR physical-design artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fir-physical-design-${{ github.run_number }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            fir_project/synth/**
+            fir_project/runs/**
