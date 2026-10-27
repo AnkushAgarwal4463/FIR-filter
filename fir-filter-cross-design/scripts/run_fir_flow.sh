@@ -47,6 +47,13 @@ sed "s|__LIB_FILE__|${LIBERTY}|g" \
 echo "===== Run Yosys synthesis ====="
 yosys -l "$RUN_DIR/synthesis.log" \
     -s fir_project/synth/synth_fir.generated.ys
+    
+echo "===== Generated netlist: lines 1-25 ====="
+nl -ba fir_project/synth/fir_filter_netlist.v | sed -n '1,25p'
+
+echo "===== Netlist file type and size ====="
+file fir_project/synth/fir_filter_netlist.v
+wc -l fir_project/synth/fir_filter_netlist.v
 
 for f in "$NETLIST" "$NETLIST_JSON"; do
     if [[ ! -s "$f" ]]; then
