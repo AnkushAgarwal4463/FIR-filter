@@ -15,21 +15,25 @@ on:
 
   push:
     paths:
-      - "rtl/**"
-      - "tb/**"
-      - "scripts/**"
-      - "constraints/**"
-      - "config/**"
+      - "fir-filter-cross-design/rtl/**"
+      - "fir-filter-cross-design/tb/**"
+      - "fir-filter-cross-design/scripts/**"
+      - "fir-filter-cross-design/constraints/**"
+      - "fir-filter-cross-design/config/**"
+      - "fir-filter-cross-design/Makefile"
+      - "fir-filter-cross-design/README.md"
       - "environment.yml"
       - ".github/workflows/fir-physical-design.yml"
 
   pull_request:
     paths:
-      - "rtl/**"
-      - "tb/**"
-      - "scripts/**"
-      - "constraints/**"
-      - "config/**"
+      - "fir-filter-cross-design/rtl/**"
+      - "fir-filter-cross-design/tb/**"
+      - "fir-filter-cross-design/scripts/**"
+      - "fir-filter-cross-design/constraints/**"
+      - "fir-filter-cross-design/config/**"
+      - "fir-filter-cross-design/Makefile"
+      - "fir-filter-cross-design/README.md"
       - "environment.yml"
       - ".github/workflows/fir-physical-design.yml"
 
@@ -58,15 +62,28 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check project structure
+        shell: bash
         run: |
           set -euo pipefail
 
-          echo "Repository root: $PWD"
-          echo "Root directory contents:"
+          echo "Project directory: $PWD"
+          echo "Project directory contents:"
           ls -la
 
+          echo ""
+          echo "Checking environment.yml in repository root..."
+
+          if [[ -f "../environment.yml" ]]; then
+            echo "FOUND: environment.yml (repository root)"
+          else
+            echo "MISSING: environment.yml (repository root)"
+            exit 1
+          fi
+
+          echo ""
+          echo "Checking FIR project files..."
+
           files=(
-            "environment.yml"
             "Makefile"
             "rtl/fir_filter.v"
             "tb/tb_fir_filter.v"
@@ -91,9 +108,11 @@ jobs:
 
           if [[ "$missing" -ne 0 ]]; then
             echo "ERROR: $missing required project files are missing."
-            echo "Move the project contents to the repository root."
             exit 1
           fi
+
+          echo ""
+          echo "SUCCESS: All required project files were found."
 
       - name: Set up Python, Yosys, and Icarus Verilog
         uses: mamba-org/setup-micromamba@v2
@@ -105,6 +124,7 @@ jobs:
           post-cleanup: none
 
       - name: Verify installed tools
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -114,21 +134,26 @@ jobs:
 
           if ! command -v openroad >/dev/null 2>&1; then
             echo "ERROR: OpenROAD is not installed."
-            echo "Install it from a verified, compatible source before continuing."
+            echo "Install OpenROAD from a verified, compatible source."
             exit 1
           fi
 
           openroad -version
 
       - name: Verify Sky130A PDK configuration
+        shell: bash
         run: |
           set -euo pipefail
 
           source config/sky130_example.env
 
-          test -f "$LIBERTY"
-          test -f "$CELL_LEF"
-          test -f "$TECH_LEF"
+          for file in "$LIBERTY" "$CELL_LEF" "$TECH_LEF"; do
+            if [[ ! -f "$file" ]]; then
+              echo "ERROR: Required PDK file not found: $file"
+              exit 1
+            fi
+            echo "FOUND: $file"
+          done
 
           echo "Sky130A Liberty and LEF files verified."
 
@@ -136,6 +161,7 @@ jobs:
         run: make sim
 
       - name: Run FIR synthesis and physical design
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -147,10 +173,15 @@ jobs:
 
       - name: List generated outputs
         if: always()
+        shell: bash
         run: |
           echo "===== Generated project outputs ====="
-          find fir_project -maxdepth 6 -type f -print 2>/dev/null \
-            | sort || true
+
+          if [[ -d fir_project ]]; then
+            find fir_project -maxdepth 6 -type f -print | sort
+          else
+            echo "No fir_project directory was generated."
+          fi
 
       - name: Upload FIR physical-design artifacts
         if: always()
@@ -160,5 +191,5 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
           path: |
-            fir_project/synth/**
-            fir_project/runs/**
+            fir-filter-cross-design/fir_project/synth/**
+            fir-filter-cross-design/fir_project/runs/**
