@@ -210,6 +210,31 @@ jobs:
           chmod +x scripts/run_fir_flow.sh
           ./scripts/run_fir_flow.sh
 
+          
+      - name: Display numerical feature CSVs
+        if: always()
+        run: |
+          set -u
+
+          RUN_DIR="fir_project/runs/fir_8tap_w8_util${UTIL}_clk${CLK_PERIOD}"
+
+          for file in \
+            "$RUN_DIR/features.csv" \
+            "$RUN_DIR/fir_features.csv" \
+            "$RUN_DIR/physical_targets.csv" \
+            "$RUN_DIR/preplacement_features.csv"; do
+
+            echo
+            echo "========== $file =========="
+
+            if [[ -s "$file" ]]; then
+              cat "$file"
+            else
+              echo "File missing or empty."
+            fi
+          done
+
+
       - name: List generated outputs
         if: always()
         run: |
