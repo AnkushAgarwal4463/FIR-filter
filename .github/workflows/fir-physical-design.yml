@@ -1,3 +1,4 @@
+
 name: FIR Synthesis and Physical Design
 
 on:
@@ -57,7 +58,18 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Yosys, OpenROAD, Icarus Verilog, and Sky130A
+      - name: Check project structure
+        run: |
+          set -euo pipefail
+          test -f environment.yml
+          test -f Makefile
+          test -f rtl/fir_filter.v
+          test -f scripts/run_fir_flow.sh
+          test -f scripts/flow_fir.tcl
+          test -f scripts/synth_fir.ys
+          test -f config/sky130_example.env
+
+      - name: Set up Python, Yosys, and Icarus Verilog
         uses: mamba-org/setup-micromamba@v2
         with:
           environment-file: environment.yml
@@ -66,51 +78,80 @@ jobs:
           init-shell: bash
           post-cleanup: none
 
-      - name: Print tool versions and verify PDK files
+      - name: Install OpenROAD and system utilities
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            openroad \
+            git \
+            make \
+            curl \
+            ca-certificates
+
+      - name: Obtain Sky130A platform files
         run: |
           set -euo pipefail
 
-          command -v yosys
-          command -v openroad
-          command -v iverilog
+          git clone --depth 1 \
+            https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts.git \
+            "$RUNNER_TEMP/OpenROAD-flow-scripts"
 
+          export PDK_ROOT="$RUNNER_TEMP/OpenROAD-flow-scripts/flow/platforms"
+          export SKY130_PLATFORM="$PDK_ROOT/sky130hd"
+
+          test -d "$SKY130_PLATFORM"
+
+          LIBERTY="$(find "$SKY130_PLATFORM" -type f \
+            -name 'sky130_fd_sc_hd__tt_025C_5v00.lib' -print -quit)"
+          CELL_LEF="$(find "$SKY130_PLATFORM" -type f \
+            -name 'sky130_fd_sc_hd.lef' -print -quit)"
+          TECH_LEF="$(find "$SKY130_PLATFORM" -type f \
+            -name 'sky130_fd_sc_hd.tlef' -print -quit)"
+
+          test -n "$LIBERTY"
+          test -n "$CELL_LEF"
+          test -n "$TECH_LEF"
+
+          echo "PDK_ROOT=$PDK_ROOT" >> "$GITHUB_ENV"
+          echo "LIBERTY=$LIBERTY" >> "$GITHUB_ENV"
+          echo "CELL_LEF=$CELL_LEF" >> "$GITHUB_ENV"
+          echo "TECH_LEF=$TECH_LEF" >> "$GITHUB_ENV"
+
+          echo "Liberty: $LIBERTY"
+          echo "Cell LEF: $CELL_LEF"
+          echo "Technology LEF: $TECH_LEF"
+
+      - name: Verify tool installation
+        run: |
+          set -euo pipefail
+          python --version
           yosys -V
-          openroad -version
           iverilog -V 2>&1 | head -n 2
-
-          export PDK_ROOT="${CONDA_PREFIX}/share/pdk/sky130A"
-
-          test -f "$PDK_ROOT/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_5v00.lib"
-          test -f "$PDK_ROOT/libs.ref/sky130_fd_sc_hd/lef/sky130_fd_sc_hd.lef"
-          test -f "$PDK_ROOT/libs.tech/lef/sky130_fd_sc_hd.tlef"
+          openroad -version
+          test -f "$LIBERTY"
+          test -f "$CELL_LEF"
+          test -f "$TECH_LEF"
 
       - name: Run RTL simulation
         run: make sim
 
-      - name: Run FIR synthesis, placement, timing, and routing
+      - name: Run FIR synthesis and physical design
         run: |
           set -euo pipefail
 
           export RUN_TAG="fir_8tap_w8_util${UTIL}_clk${CLK_PERIOD}"
+          export RUN_DIR="fir_project/runs/${RUN_TAG}"
 
-          echo "Utilization: ${UTIL}%"
-          echo "Clock period: ${CLK_PERIOD} ns"
-          echo "Run tag: ${RUN_TAG}"
-
+          chmod +x scripts/run_fir_flow.sh
           ./scripts/run_fir_flow.sh
 
-      - name: Check expected outputs
+      - name: List generated outputs
         if: always()
         run: |
-          echo "===== FIR run files ====="
-
-          find fir_project -maxdepth 5 -type f -print 2>/dev/null | sort || true
-
-          RUN_TAG="fir_8tap_w8_util${UTIL}_clk${CLK_PERIOD}"
-          RUN_DIR="fir_project/runs/${RUN_TAG}"
-
-          test -s "$RUN_DIR/openroad_log.txt" || true
-          test -s "$RUN_DIR/features.json" || true
+          echo "===== Project files ====="
+          find fir_project -maxdepth 6 -type f -print 2>/dev/null \
+            | sort || true
 
       - name: Upload FIR physical-design artifacts
         if: always()
