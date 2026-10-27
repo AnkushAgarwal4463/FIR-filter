@@ -51,6 +51,7 @@ jobs:
     defaults:
       run:
         working-directory: fir-filter-cross-design
+        shell: bash -el {0}
 
     env:
       UTIL: ${{ inputs.utilization || '40' }}
@@ -62,26 +63,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Check project structure
-        shell: bash
         run: |
           set -euo pipefail
 
           echo "Project directory: $PWD"
-          echo "Project directory contents:"
           ls -la
 
-          echo ""
           echo "Checking environment.yml in repository root..."
-
-          if [[ -f "../environment.yml" ]]; then
-            echo "FOUND: environment.yml (repository root)"
-          else
-            echo "MISSING: environment.yml (repository root)"
-            exit 1
-          fi
-
-          echo ""
-          echo "Checking FIR project files..."
+          test -f ../environment.yml
+          echo "FOUND: environment.yml"
 
           files=(
             "Makefile"
@@ -96,7 +86,6 @@ jobs:
           )
 
           missing=0
-
           for file in "${files[@]}"; do
             if [[ -f "$file" ]]; then
               echo "FOUND: $file"
@@ -107,12 +96,11 @@ jobs:
           done
 
           if [[ "$missing" -ne 0 ]]; then
-            echo "ERROR: $missing required project files are missing."
+            echo "ERROR: $missing project files are missing."
             exit 1
           fi
 
-          echo ""
-          echo "SUCCESS: All required project files were found."
+          echo "SUCCESS: All required files were found."
 
       - name: Set up Python, Yosys, and Icarus Verilog
         uses: mamba-org/setup-micromamba@v2
@@ -123,25 +111,35 @@ jobs:
           init-shell: bash
           post-cleanup: none
 
-      - name: Verify installed tools
-        shell: bash
+      - name: Diagnose Conda environment
         run: |
           set -euo pipefail
 
+          echo "CONDA_PREFIX=${CONDA_PREFIX:-unset}"
+          echo "Python:"
+          command -v python
           python --version
+
+          echo "Yosys:"
+          command -v yosys
           yosys -V
+
+          echo "Icarus Verilog:"
+          command -v iverilog
           iverilog -V 2>&1 | head -n 2
 
+      - name: Verify OpenROAD
+        run: |
+          set -euo pipefail
+
           if ! command -v openroad >/dev/null 2>&1; then
-            echo "ERROR: OpenROAD is not installed."
-            echo "Install OpenROAD from a verified, compatible source."
+            echo "ERROR: OpenROAD is not installed or is not on PATH."
             exit 1
           fi
 
           openroad -version
 
       - name: Verify Sky130A PDK configuration
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -155,13 +153,12 @@ jobs:
             echo "FOUND: $file"
           done
 
-          echo "Sky130A Liberty and LEF files verified."
+          echo "Sky130A PDK files verified."
 
       - name: Run RTL simulation
         run: make sim
 
       - name: Run FIR synthesis and physical design
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -173,10 +170,8 @@ jobs:
 
       - name: List generated outputs
         if: always()
-        shell: bash
         run: |
           echo "===== Generated project outputs ====="
-
           if [[ -d fir_project ]]; then
             find fir_project -maxdepth 6 -type f -print | sort
           else
