@@ -248,6 +248,42 @@ jobs:
             fi
           done
 
+          
+      - name: Populate FIR configuration CSV
+        if: always()
+        run: |
+          set -euo pipefail
+
+          RUN_DIR="fir_project/runs/fir_8tap_w8_util40_clk10"
+          CSV="$RUN_DIR/fir_features.csv"
+
+          if [[ ! -d "$RUN_DIR" ]]; then
+            echo "Run directory not found: $RUN_DIR"
+            exit 0
+          fi
+
+          # Preserve the existing header and replace any old data rows.
+          printf '%s\n' \
+            '"run_id","taps","data_width","coeff_width","acc_width","utilization","place_density","clk_period_ns","flow_status","last_completed_stage"' \
+            > "$CSV"
+
+          if [[ -f "$RUN_DIR/final.odb" && -f "$RUN_DIR/final.def" ]]; then
+            STATUS="completed"
+            STAGE="detailed_routing"
+          else
+            STATUS="incomplete"
+            STAGE="unknown"
+          fi
+
+          printf '"%s",%s,%s,%s,%s,%s,%s,%s,"%s","%s"\n' \
+            "fir_filter_8tap" \
+            "8" "8" "8" "24" "40" "0.40" "10.0" \
+            "$STATUS" "$STAGE" >> "$CSV"
+
+          echo "===== Populated FIR configuration CSV ====="
+          cat "$CSV"
+
+
 
 
       - name: List generated outputs
