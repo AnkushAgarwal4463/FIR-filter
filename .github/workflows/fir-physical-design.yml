@@ -64,7 +64,7 @@ jobs:
           environment-name: fir-pd-flow
           cache-environment: true
           init-shell: bash
-          post-cleanup: all
+          post-cleanup: none
 
       - name: Print tool versions and verify PDK files
         run: |
