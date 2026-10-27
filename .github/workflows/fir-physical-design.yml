@@ -211,12 +211,26 @@ jobs:
           ./scripts/run_fir_flow.sh
 
           
+      
       - name: Display numerical feature CSVs
         if: always()
         run: |
           set -u
 
-          RUN_DIR="fir_project/runs/fir_8tap_w8_util${UTIL}_clk${CLK_PERIOD}"
+          BASE_DIR="fir_project/runs"
+
+          echo "===== Available run directories ====="
+          find "$BASE_DIR" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null || true
+
+          RUN_DIR="$(find "$BASE_DIR" -mindepth 1 -maxdepth 1 \
+            -type d -name 'fir_8tap_w8_util*_clk*' -print -quit 2>/dev/null || true)"
+
+          if [[ -z "$RUN_DIR" ]]; then
+            echo "ERROR: FIR run directory not found."
+            exit 0
+          fi
+
+          echo "Using run directory: $RUN_DIR"
 
           for file in \
             "$RUN_DIR/features.csv" \
@@ -233,6 +247,7 @@ jobs:
               echo "File missing or empty."
             fi
           done
+
 
 
       - name: List generated outputs
