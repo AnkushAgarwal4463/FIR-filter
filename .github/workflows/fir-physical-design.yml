@@ -43,11 +43,10 @@ concurrency:
 jobs:
   fir-physical-design:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
 
     defaults:
       run:
-        shell: bash -el {0}
+        working-directory: fir-filter-cross-design
 
     env:
       UTIL: ${{ inputs.utilization || '40' }}
