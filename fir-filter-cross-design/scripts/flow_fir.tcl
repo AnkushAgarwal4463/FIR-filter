@@ -28,8 +28,17 @@ fconfigure $::diag_fd -buffering line
 
 proc log_msg {message} {
     puts $message
-    puts $::diag_fd $message
-    flush $::diag_fd
+    if {[info exists ::diag_fd] && $::diag_fd ne ""} {
+        puts $::diag_fd $message
+        flush $::diag_fd
+    }
+}
+
+proc close_diag_log {} {
+    if {[info exists ::diag_fd] && $::diag_fd ne ""} {
+        close $::diag_fd
+        set ::diag_fd ""
+    }
 }
 
 proc run_step {label script} {
@@ -56,7 +65,7 @@ proc run_step {label script} {
         log_msg "Elapsed before failure: [expr {[clock seconds] - $start_time}] seconds"
         log_msg "Diagnostic log: $::diag_log"
 
-        close $::diag_fd
+        close_diag_log
         return -options $options $result
     }
 
@@ -75,6 +84,7 @@ proc optional_step {label script} {
         if {[dict exists $options -errorinfo]} {
             log_msg [dict get $options -errorinfo]
         }
+
         return 0
     }
 
@@ -94,10 +104,14 @@ proc require_file {path description} {
     log_msg "ARTIFACT OK: $description ($path, [file size $path] bytes)"
 }
 
+# ------------------------------------------------------------
+# Startup information
+# Use Unix timestamps; avoid clock format/timezone dependencies.
+# ------------------------------------------------------------
 log_msg ""
 log_msg "############################################################"
 log_msg "FIR PHYSICAL-DESIGN FLOW"
-log_msg "Started: [clock format [clock seconds]]"
+log_msg "Started (Unix timestamp): [clock seconds]"
 log_msg "RUN_DIR: $::env(RUN_DIR)"
 log_msg "UTIL: $::env(UTIL)"
 log_msg "PLACE_DENSITY: $::env(PLACE_DENSITY)"
@@ -184,7 +198,6 @@ run_step "Global placement" {
     global_placement -density $::env(PLACE_DENSITY)
 }
 
-# Save a checkpoint when supported by this OpenROAD build.
 optional_step "Save post-global-placement database" {
     write_db "$::env(RUN_DIR)/after_global_placement.odb"
 }
@@ -205,7 +218,7 @@ optional_step "Save post-placement database" {
 }
 
 # ------------------------------------------------------------
-# 7. Timing repair
+# 7. Setup timing repair
 # ------------------------------------------------------------
 optional_step "Setup timing repair" {
     repair_timing -setup -setup_margin 0.2
@@ -259,7 +272,7 @@ optional_step "Save post-detailed-routing database" {
 }
 
 # ------------------------------------------------------------
-# 11. Save final design
+# 11. Save and validate final design
 # ------------------------------------------------------------
 run_step "Write final DEF" {
     write_def "$::env(RUN_DIR)/final.def"
@@ -317,9 +330,9 @@ optional_step "Final design area report" {
 log_msg ""
 log_msg "############################################################"
 log_msg "FIR PHYSICAL-DESIGN FLOW COMPLETED"
-log_msg "Finished: [clock format [clock seconds]]"
+log_msg "Finished (Unix timestamp): [clock seconds]"
 log_msg "Results directory: $::env(RUN_DIR)"
 log_msg "Diagnostic log: $::diag_log"
 log_msg "############################################################"
 
-close $::diag_fd
+close_diag_log
