@@ -17,5 +17,5 @@ opt
 clean
 check
 write_json fir_project/synth/fir_filter_netlist.json
-write_verilog -noattr fir_project/synth/fir_filter_netlist.v
+write_verilog -noattr -noexpr fir_project/synth/fir_filter_netlist.v
 stat -liberty "__LIB_FILE__"
