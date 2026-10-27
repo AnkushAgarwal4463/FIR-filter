@@ -254,7 +254,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          RUN_DIR="fir_project/runs/fir_8tap_w8_util40_clk10"
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN {
+            sub(/0+$/, "", c)
+            sub(/\.$/, "", c)
+            print c
+          }')"
+
+          RUN_TAG="fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
+          RUN_DIR="fir_project/runs/${RUN_TAG}"
           CSV="$RUN_DIR/fir_features.csv"
 
           if [[ ! -d "$RUN_DIR" ]]; then
@@ -262,27 +269,33 @@ jobs:
             exit 0
           fi
 
-          # Preserve the existing header and replace any old data rows.
+          DENSITY="$(awk -v u="$UTIL" \
+            'BEGIN { printf "%.2f", u / 100 }')"
+
+          mkdir -p "$RUN_DIR"
+
           printf '%s\n' \
             '"run_id","taps","data_width","coeff_width","acc_width","utilization","place_density","clk_period_ns","flow_status","last_completed_stage"' \
             > "$CSV"
 
-          if [[ -f "$RUN_DIR/final.odb" && -f "$RUN_DIR/final.def" ]]; then
-            STATUS="completed"
-            STAGE="detailed_routing"
+          # Artifacts alone do not prove that detailed routing succeeded.
+          STATUS="artifacts_present_unverified"
+          STAGE="unknown"
+
+          if [[ -f "$RUN_DIR/final.odb" &&
+                -f "$RUN_DIR/final.def" ]]; then
+            STATUS="artifacts_present"
           else
-            STATUS="incomplete"
-            STAGE="unknown"
+            STATUS="incomplete_or_missing_artifacts"
           fi
 
           printf '"%s",%s,%s,%s,%s,%s,%s,%s,"%s","%s"\n' \
             "fir_filter_8tap" \
-            "8" "8" "8" "24" "40" "0.40" "10.0" \
+            8 8 8 24 "$UTIL" "$DENSITY" "$CLK_PERIOD" \
             "$STATUS" "$STAGE" >> "$CSV"
 
-          echo "===== Populated FIR configuration CSV ====="
+          echo "===== FIR configuration CSV ====="
           cat "$CSV"
-
 
 
 
@@ -296,6 +309,50 @@ jobs:
           else
             echo "No fir_project directory was generated."
           fi
+
+      - name: Inspect timing and routing reports
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          RUN_DIR="$(find fir_project/runs \
+            -mindepth 1 -maxdepth 1 \
+            -type d -name 'fir_8tap_w8_util*_clk*' \
+            -print -quit)"
+
+          if [ -z "$RUN_DIR" ]; then
+            echo "FIR run directory not found"
+            exit 1
+          fi
+
+          echo "Using: $RUN_DIR"
+
+          for f in \
+            timing_setup.rpt \
+            timing_hold.rpt \
+            wns_setup.rpt \
+            tns_setup.rpt \
+            wns_hold.rpt \
+            timing_setup_global_route.rpt \
+            wns_setup_global_route.rpt \
+            tns_setup_global_route.rpt \
+            flow_diagnostics.log \
+            openroad_log.txt
+          do
+            if [ -f "$RUN_DIR/$f" ]; then
+              echo ""
+              echo "========== $f =========="
+              cat "$RUN_DIR/$f"
+            fi
+          done
+
+          echo ""
+          echo "========== Routing/congestion keywords =========="
+          grep -Ein \
+            'slack|wns|tns|overflow|congestion|wire.?length|total wire|route' \
+            "$RUN_DIR/openroad_log.txt" \
+            "$RUN_DIR/flow_diagnostics.log" || true
 
       - name: Upload FIR physical-design artifacts
         if: always()
