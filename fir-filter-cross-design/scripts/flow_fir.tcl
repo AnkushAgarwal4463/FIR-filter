@@ -336,3 +336,93 @@ log_msg "Diagnostic log: $::diag_log"
 log_msg "############################################################"
 
 close_diag_log
+
+# ------------------------------------------------------------
+# Feature CSV: configuration and flow status
+# ------------------------------------------------------------
+
+set ::feature_csv "$::env(RUN_DIR)/fir_features.csv"
+set ::feature_status "IN_PROGRESS"
+
+proc csv_escape {value} {
+    set value [string map [list "\"" "\"\""] $value]
+    return "\"$value\""
+}
+
+proc write_feature_row {path values} {
+    set fd [open $path "w"]
+    fconfigure $fd -buffering line
+
+    set escaped {}
+    foreach value $values {
+        lappend escaped [csv_escape $value]
+    }
+
+    puts $fd [join $escaped ","]
+    close $fd
+}
+
+# Add these environment variables in the runner if available.
+set taps ""
+set data_width ""
+set coeff_width ""
+set acc_width ""
+set clk_period ""
+
+foreach {env_name variable_name} {
+    TAPS taps
+    DATA_WIDTH data_width
+    COEFF_WIDTH coeff_width
+    ACC_WIDTH acc_width
+    CLK_PERIOD_NS clk_period
+} {
+    if {[info exists ::env($env_name)]} {
+        set $variable_name $::env($env_name)
+    }
+}
+
+# A first snapshot ensures that a CSV exists before routing.
+set feature_header {
+    run_id taps data_width coeff_width acc_width
+    utilization place_density clk_period_ns
+    flow_status last_completed_stage
+}
+
+set feature_values [list \
+    [file tail $::env(RUN_DIR)] \
+    $taps $data_width $coeff_width $acc_width \
+    $::env(UTIL) $::env(PLACE_DENSITY) $clk_period \
+    $::feature_status "CSV_INITIALIZED" \
+]
+
+write_feature_row $::feature_csv $feature_header
+set ::feature_csv_fd [open $::feature_csv "a"]
+fconfigure $::feature_csv_fd -buffering line
+
+set ::feature_header_written 1
+
+proc update_feature_status {status stage} {
+    global feature_csv feature_csv_fd
+
+    # Append an audit record to a separate file so the CSV
+    # remains a single-row dataset with a stable column schema.
+    set status_file "[file rootname $feature_csv]_status.csv"
+    set is_new [expr {![file exists $status_file]}]
+    set fd [open $status_file "a"]
+    fconfigure $fd -buffering line
+
+    if {$is_new} {
+        puts $fd "run_id,status,last_completed_stage,unix_timestamp"
+    }
+
+    set row [list \
+        [file tail $::env(RUN_DIR)] \
+        $status $stage [clock seconds]]
+
+    set escaped {}
+    foreach value $row {
+        lappend escaped [csv_escape $value]
+    }
+    puts $fd [join $escaped ","]
+    close $fd
+}
