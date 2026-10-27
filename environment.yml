@@ -1,0 +1,14 @@
+name: fir-pd-flow
+
+channels:
+  - litex-hub
+  - conda-forge
+
+channel_priority: strict
+
+dependencies:
+  - python=3.11
+  - yosys
+  - openroad
+  - sky130
+  - iverilog
