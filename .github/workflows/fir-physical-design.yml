@@ -117,11 +117,11 @@ jobs:
           init-shell: bash
           post-cleanup: none
 
+      
       - name: Verify OpenROAD and synthesis tools
         run: |
           set -euo pipefail
 
-          # Load the tool paths provided by the ORFS container.
           source /OpenROAD-flow-scripts/env.sh
 
           echo "Python:"
@@ -134,11 +134,14 @@ jobs:
 
           echo "Icarus Verilog:"
           command -v iverilog
-          iverilog -V 2>&1 | head -n 2
+          iverilog -V > /tmp/iverilog-version.txt 2>&1 || true
+          sed -n '1,3p' /tmp/iverilog-version.txt
 
           echo "OpenROAD:"
           command -v openroad
           openroad -version
+
+          echo "SUCCESS: Required tools are available."
 
       - name: Configure and verify Sky130HD PDK
         run: |
