@@ -61,13 +61,40 @@ jobs:
       - name: Check project structure
         run: |
           set -euo pipefail
-          test -f environment.yml
-          test -f Makefile
-          test -f rtl/fir_filter.v
-          test -f scripts/run_fir_flow.sh
-          test -f scripts/flow_fir.tcl
-          test -f scripts/synth_fir.ys
-          test -f config/sky130_example.env
+
+          echo "Repository root: $PWD"
+          echo "Root directory contents:"
+          ls -la
+
+          files=(
+            "environment.yml"
+            "Makefile"
+            "rtl/fir_filter.v"
+            "tb/tb_fir_filter.v"
+            "scripts/run_fir_flow.sh"
+            "scripts/flow_fir.tcl"
+            "scripts/synth_fir.ys"
+            "scripts/extract_fir_features.py"
+            "constraints/fir_filter.sdc.in"
+            "config/sky130_example.env"
+          )
+
+          missing=0
+
+          for file in "${files[@]}"; do
+            if [[ -f "$file" ]]; then
+              echo "FOUND: $file"
+            else
+              echo "MISSING: $file"
+              missing=$((missing + 1))
+            fi
+          done
+
+          if [[ "$missing" -ne 0 ]]; then
+            echo "ERROR: $missing required project files are missing."
+            echo "Move the project contents to the repository root."
+            exit 1
+          fi
 
       - name: Set up Python, Yosys, and Icarus Verilog
         uses: mamba-org/setup-micromamba@v2
@@ -78,60 +105,33 @@ jobs:
           init-shell: bash
           post-cleanup: none
 
-      - name: Install OpenROAD and system utilities
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            openroad \
-            git \
-            make \
-            curl \
-            ca-certificates
-
-      - name: Obtain Sky130A platform files
+      - name: Verify installed tools
         run: |
           set -euo pipefail
 
-          git clone --depth 1 \
-            https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts.git \
-            "$RUNNER_TEMP/OpenROAD-flow-scripts"
-
-          export PDK_ROOT="$RUNNER_TEMP/OpenROAD-flow-scripts/flow/platforms"
-          export SKY130_PLATFORM="$PDK_ROOT/sky130hd"
-
-          test -d "$SKY130_PLATFORM"
-
-          LIBERTY="$(find "$SKY130_PLATFORM" -type f \
-            -name 'sky130_fd_sc_hd__tt_025C_5v00.lib' -print -quit)"
-          CELL_LEF="$(find "$SKY130_PLATFORM" -type f \
-            -name 'sky130_fd_sc_hd.lef' -print -quit)"
-          TECH_LEF="$(find "$SKY130_PLATFORM" -type f \
-            -name 'sky130_fd_sc_hd.tlef' -print -quit)"
-
-          test -n "$LIBERTY"
-          test -n "$CELL_LEF"
-          test -n "$TECH_LEF"
-
-          echo "PDK_ROOT=$PDK_ROOT" >> "$GITHUB_ENV"
-          echo "LIBERTY=$LIBERTY" >> "$GITHUB_ENV"
-          echo "CELL_LEF=$CELL_LEF" >> "$GITHUB_ENV"
-          echo "TECH_LEF=$TECH_LEF" >> "$GITHUB_ENV"
-
-          echo "Liberty: $LIBERTY"
-          echo "Cell LEF: $CELL_LEF"
-          echo "Technology LEF: $TECH_LEF"
-
-      - name: Verify tool installation
-        run: |
-          set -euo pipefail
           python --version
           yosys -V
           iverilog -V 2>&1 | head -n 2
+
+          if ! command -v openroad >/dev/null 2>&1; then
+            echo "ERROR: OpenROAD is not installed."
+            echo "Install it from a verified, compatible source before continuing."
+            exit 1
+          fi
+
           openroad -version
+
+      - name: Verify Sky130A PDK configuration
+        run: |
+          set -euo pipefail
+
+          source config/sky130_example.env
+
           test -f "$LIBERTY"
           test -f "$CELL_LEF"
           test -f "$TECH_LEF"
+
+          echo "Sky130A Liberty and LEF files verified."
 
       - name: Run RTL simulation
         run: make sim
@@ -149,7 +149,7 @@ jobs:
       - name: List generated outputs
         if: always()
         run: |
-          echo "===== Project files ====="
+          echo "===== Generated project outputs ====="
           find fir_project -maxdepth 6 -type f -print 2>/dev/null \
             | sort || true
 
