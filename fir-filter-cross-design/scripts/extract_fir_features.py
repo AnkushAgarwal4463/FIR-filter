@@ -875,6 +875,7 @@ def main() -> int:
         results = []
         failures = []
 
+       
         for index, row in enumerate(rows, start=1):
             run_id = row.get("run_id") or Path(row["run_dir"]).name
 
@@ -882,14 +883,14 @@ def main() -> int:
 
             try:
                 if direct_mode:
-                    # Resolve the actual run directory relative to the repository.
+                    # Direct mode: write outputs to the existing run directory.
                     run_dir = Path(row["run_dir"]).expanduser()
-                
+
                     if not run_dir.is_absolute():
                         run_dir = manifest_dir / run_dir
-                
+
                     run_dir = run_dir.resolve()
-                
+
                     result = extract_one(
                         row=row,
                         output_root=output_root,
@@ -897,27 +898,28 @@ def main() -> int:
                         output_dir=run_dir,
                     )
                 else:
-                    # Keep manifest mode organized into one folder per run.
+                    # Manifest mode: use a separate directory for each run.
                     result = extract_one(
                         row=row,
                         output_root=output_root / "runs",
                         manifest_dir=manifest_dir,
                     )
-    
-                    results.append(result)
-                    print(f"    OK: {result['output_dir']}")
 
-                except Exception as exc:
-                    failures.append({
-                        "run_id": run_id,
-                        "run_dir": row.get("run_dir"),
-                        "error": str(exc),
-                    })
-    
-                    print(
-                        f"    ERROR: {run_id}: {exc}",
-                        file=sys.stderr,
-                    )
+                # Handle successful extraction in both modes.
+                results.append(result)
+                print(f"    OK: {result['output_dir']}")
+
+            except Exception as exc:
+                failures.append({
+                    "run_id": run_id,
+                    "run_dir": row.get("run_dir"),
+                    "error": str(exc),
+                })
+
+                print(
+                    f"    ERROR: {run_id}: {exc}",
+                    file=sys.stderr,
+                )
 
         if not results:
             write_json(
