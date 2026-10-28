@@ -76,8 +76,12 @@ fir_step "initialize_floorplan" [list initialize_floorplan \
 fir_step "make_tracks" [list make_tracks]
 fir_step "set_wire_rc" [list set_wire_rc -layer met2]
 
+# Place top-level I/O pins before standard-cell placement.
+fir_step "place_io_pins" [list place_pins -hor_layers met3 -ver_layers met2]
+
 # Placement and optional optimization.
 fir_step "global_placement" [list global_placement -density $::env(PLACE_DENSITY)]
+
 if {[catch {repair_design} result]} {
     fir_log "WARNING: repair_design was skipped/failed: $result"
 } else {
