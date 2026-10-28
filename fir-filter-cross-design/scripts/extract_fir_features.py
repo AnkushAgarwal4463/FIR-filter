@@ -893,6 +893,68 @@ def write_human_report(
     )
 
 
+def write_configuration_csv(
+    outdir: Path,
+    run_dir: Path,
+    args: argparse.Namespace,
+    post: dict[str, Any],
+) -> None:
+    """Write the FIR configuration and automatically detected flow status."""
+
+    def_ok = bool(
+        post.get("final_def_available")
+        and post.get("final_def_nonempty")
+    )
+    odb_ok = bool(post.get("final_odb_available"))
+    route_success = bool(
+        post.get("detailed_route_success_marker_found")
+    )
+
+    if route_success and def_ok and odb_ok:
+        flow_status = "detailed_routing_completed"
+        last_stage = "detailed_routing"
+    elif def_ok and odb_ok:
+        flow_status = "artifacts_present"
+        last_stage = "unknown"
+    elif def_ok or odb_ok:
+        flow_status = "partial_artifacts"
+        last_stage = "unknown"
+    elif post.get("log_files_found"):
+        flow_status = "flow_incomplete_or_unverified"
+        last_stage = "unknown"
+    else:
+        flow_status = "no_artifacts_or_logs"
+        last_stage = "unknown"
+
+    fields = [
+        "run_id",
+        "taps",
+        "data_width",
+        "coeff_width",
+        "acc_width",
+        "utilization",
+        "place_density",
+        "clk_period_ns",
+        "flow_status",
+        "last_completed_stage",
+    ]
+
+    row = {
+        "run_id": args.run_id or run_dir.name,
+        "taps": args.taps,
+        "data_width": args.data_width,
+        "coeff_width": args.coeff_width,
+        "acc_width": args.acc_width,
+        "utilization": args.utilization,
+        "place_density": args.place_density,
+        "clk_period_ns": args.clock_period,
+        "flow_status": flow_status,
+        "last_completed_stage": last_stage,
+    }
+
+    write_rows_csv(outdir / "fir_features.csv", fields, row)
+
+
 # ============================================================
 # Main
 # ============================================================
@@ -988,6 +1050,12 @@ def main() -> int:
             post,
             args,
             run_dir,
+        )
+        write_configuration_csv(
+            outdir,
+            run_dir,
+            args,
+            post,
         )
 
         status = {
