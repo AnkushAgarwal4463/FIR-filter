@@ -1,3 +1,4 @@
+
 name: FIR Synthesis and Physical Design
 
 on:
@@ -60,6 +61,9 @@ jobs:
       CLK_PERIOD: ${{ inputs.clock_period || '10.0' }}
 
     steps:
+      # ------------------------------------------------------
+      # 1. Checkout and verify project structure
+      # ------------------------------------------------------
       - name: Check out repository
         uses: actions/checkout@v4
 
@@ -83,6 +87,7 @@ jobs:
             "scripts/flow_fir.tcl"
             "scripts/synth_fir.ys"
             "scripts/extract_fir_features.py"
+            "scripts/extract_fir_features_readable.py"
             "constraints/fir_filter.sdc.in"
             "config/sky130_example.env"
           )
@@ -99,12 +104,15 @@ jobs:
           done
 
           if [[ "$missing" -ne 0 ]]; then
-            echo "ERROR: $missing project files are missing."
+            echo "ERROR: $missing required project file(s) are missing."
             exit 1
           fi
 
           echo "All required project files were found."
 
+      # ------------------------------------------------------
+      # 2. Set up Python environment
+      # ------------------------------------------------------
       - name: Set up Python, Yosys, and Icarus Verilog
         uses: mamba-org/setup-micromamba@v2
         with:
@@ -114,31 +122,45 @@ jobs:
           init-shell: bash
           post-cleanup: none
 
-      - name: Verify OpenROAD and synthesis tools
+      # ------------------------------------------------------
+      # 3. Verify tools and validate scripts
+      # ------------------------------------------------------
+      - name: Verify tools and validate scripts
         run: |
           set -euo pipefail
 
           source /OpenROAD-flow-scripts/env.sh
 
-          echo "Python:"
+          echo "===== Python ====="
           command -v python
           python --version
 
-          echo "Yosys:"
+          echo "===== Yosys ====="
           command -v yosys
           yosys -V
 
-          echo "Icarus Verilog:"
+          echo "===== Icarus Verilog ====="
           command -v iverilog
           iverilog -V > /tmp/iverilog-version.txt 2>&1 || true
           sed -n '1,3p' /tmp/iverilog-version.txt
 
-          echo "OpenROAD:"
+          echo "===== OpenROAD ====="
           command -v openroad
           openroad -version
 
-          echo "SUCCESS: Required tools are available."
+          echo "===== Bash syntax ====="
+          bash -n scripts/run_fir_flow.sh
 
+          echo "===== Python syntax ====="
+          python -m py_compile \
+            scripts/extract_fir_features.py \
+            scripts/extract_fir_features_readable.py
+
+          echo "SUCCESS: Tools and scripts passed validation."
+
+      # ------------------------------------------------------
+      # 4. Configure and verify Sky130HD
+      # ------------------------------------------------------
       - name: Configure and verify Sky130HD PDK
         run: |
           set -euo pipefail
@@ -155,14 +177,16 @@ jobs:
             "$LIBERTY_PATH" \
             "$TECH_LEF_PATH" \
             "$CELL_LEF_PATH"; do
+
             if [[ ! -f "$file" ]]; then
-              echo "ERROR: Expected ORFS Sky130HD file not found: $file"
+              echo "ERROR: Expected Sky130HD file not found: $file"
               echo "Available platform files:"
-              find "$ORFS_PLATFORM" -maxdepth 3 -type f \
+              find "$ORFS_PLATFORM" -maxdepth 4 -type f \
                 \( -name "*.lib" -o -name "*.lef" \) \
                 -print 2>/dev/null | sort || true
               exit 1
             fi
+
             echo "FOUND: $file"
           done
 
@@ -186,95 +210,86 @@ jobs:
 
           echo "Sky130HD PDK paths configured and verified."
 
+      # ------------------------------------------------------
+      # 5. Run RTL simulation
+      # ------------------------------------------------------
       - name: Run RTL simulation
         run: |
           set -euo pipefail
           make sim
 
+      # ------------------------------------------------------
+      # 6. Run synthesis and physical design
+      # ------------------------------------------------------
       - name: Run FIR synthesis and physical design
         run: |
           set -euo pipefail
 
           source /OpenROAD-flow-scripts/env.sh
 
-          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN {
-            sub(/0+$/, "", c)
-            sub(/\.$/, "", c)
-            print c
-          }')"
+          # Normalize clock period without stripping significant
+          # trailing zeros from integer inputs such as 20 or 40.
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" \
+            'BEGIN { printf "%g", c + 0 }')"
 
+          # Validate configuration values.
+          awk -v u="$UTIL" '
+            BEGIN {
+              if (u + 0 < 1 || u + 0 > 100 || u !~ /^[0-9]+$/) {
+                print "ERROR: Utilization must be an integer from 1 to 100."
+                exit 1
+              }
+            }
+          '
+
+          awk -v c="$CLK_PERIOD" '
+            BEGIN {
+              if (c !~ /^[0-9]+([.][0-9]+)?$/ || c + 0 <= 0) {
+                print "ERROR: Clock period must be a positive number."
+                exit 1
+              }
+            }
+          '
+
+          export UTIL
+          export CLK_PERIOD
+          export CLK_PERIOD_NS="$CLK_PERIOD"
           export PLACE_DENSITY="$(awk -v u="$UTIL" \
             'BEGIN { printf "%.2f", u / 100 }')"
 
           export RUN_TAG="fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
           export RUN_DIR="fir_project/runs/${RUN_TAG}"
 
+          echo "===== Run configuration ====="
           echo "RUN_TAG=$RUN_TAG"
           echo "RUN_DIR=$RUN_DIR"
           echo "UTIL=$UTIL"
           echo "PLACE_DENSITY=$PLACE_DENSITY"
           echo "CLK_PERIOD=$CLK_PERIOD"
+          echo "CLK_PERIOD_NS=$CLK_PERIOD_NS"
+
+          mkdir -p "$RUN_DIR"
 
           chmod +x scripts/run_fir_flow.sh
           ./scripts/run_fir_flow.sh
 
-      - name: Populate FIR configuration CSV
-        if: always()
-        run: |
-          set -euo pipefail
+          echo "===== Physical-design process returned successfully ====="
 
-          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN {
-            sub(/0+$/, "", c)
-            sub(/\.$/, "", c)
-            print c
-          }')"
-
-          RUN_TAG="fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
-          RUN_DIR="fir_project/runs/${RUN_TAG}"
-          CSV="$RUN_DIR/fir_features.csv"
-
-          if [[ ! -d "$RUN_DIR" ]]; then
-            echo "Run directory not found: $RUN_DIR"
-            exit 0
-          fi
-
-          DENSITY="$(awk -v u="$UTIL" \
-            'BEGIN { printf "%.2f", u / 100 }')"
-
-          mkdir -p "$RUN_DIR"
-
-          printf '%s\n' \
-            '"run_id","taps","data_width","coeff_width","acc_width","utilization","place_density","clk_period_ns","flow_status","last_completed_stage"' \
-            > "$CSV"
-
-          STATUS="artifacts_present_unverified"
-          STAGE="unknown"
-
-          if [[ -s "$RUN_DIR/final.odb" &&
-                -s "$RUN_DIR/final.def" ]]; then
-            STATUS="artifacts_present"
-          else
-            STATUS="incomplete_or_missing_artifacts"
-          fi
-
-          printf '"%s",%s,%s,%s,%s,%s,%s,%s,"%s","%s"\n' \
-            "$RUN_TAG" \
-            8 8 8 24 "$UTIL" "$DENSITY" "$CLK_PERIOD" \
-            "$STATUS" "$STAGE" >> "$CSV"
-
-          echo "Configuration CSV created: $CSV"
-          cat "$CSV"
-
+      # ------------------------------------------------------
+      # 7. Create GitHub Actions summary from generated CSVs
+      #
+      # IMPORTANT:
+      # Do not overwrite fir_features.csv here.
+      # That CSV belongs to the Tcl flow and contains its
+      # configuration/status information.
+      # ------------------------------------------------------
       - name: Create tabular feature summary
         if: always()
         run: |
           set -euo pipefail
 
-          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN {
-            sub(/0+$/, "", c)
-            sub(/\.$/, "", c)
-            print c
-          }')"
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" \
+            'BEGIN { printf "%g", c + 0 }')"
 
           RUN_TAG="fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
           RUN_DIR="fir_project/runs/${RUN_TAG}"
@@ -284,50 +299,35 @@ jobs:
 
           echo "===== Summary diagnostics ====="
           echo "Working directory: $PWD"
-          echo "Run directory: $FIR_SUMMARY_RUN_DIR"
+          echo "Run directory: $RUN_DIR"
           echo "Summary file: $SUMMARY_FILE"
-
-          echo "===== CSV availability ====="
-          for file in \
-            features.csv \
-            fir_features.csv \
-            physical_targets.csv \
-            preplacement_features.csv
-          do
-            if [[ -s "$RUN_DIR/$file" ]]; then
-              echo "FOUND: $RUN_DIR/$file"
-              wc -l "$RUN_DIR/$file"
-            else
-              echo "MISSING OR EMPTY: $RUN_DIR/$file"
-            fi
-          done
-
-          echo "===== Starting Python summary generator ====="
 
           python -u - <<'PY'
           import csv
+          import json
           import os
-          import sys
           from pathlib import Path
 
           run_dir = Path(os.environ["FIR_SUMMARY_RUN_DIR"])
           summary_path = Path(os.environ["SUMMARY_FILE"])
 
-          def markdown_cell(value):
-              value = "" if value is None else str(value)
+          def md(value):
+              if value is None:
+                  return ""
               return (
-                  value.replace("|", "\\|")
+                  str(value)
+                  .replace("|", "\\|")
                   .replace("\r", " ")
                   .replace("\n", " ")
               )
 
-          def render_csv(out, title, filename, columns):
+          def render_csv(out, title, filename, columns=None):
               path = run_dir / filename
               out.write(f"## {title}\n\n")
 
               if not path.is_file():
-                  out.write(f"> CSV not found: `{filename}`\n\n")
-                  print(f"WARNING: CSV not found: {path}")
+                  out.write(f"> File not found: `{filename}`\n\n")
+                  print(f"WARNING: Missing file: {path}")
                   return
 
               try:
@@ -338,51 +338,67 @@ jobs:
                       headers = reader.fieldnames or []
                       rows = list(reader)
               except (OSError, csv.Error, UnicodeError) as exc:
-                  out.write(f"> Could not read `{filename}`: {exc}\n\n")
-                  print(f"ERROR: Could not read {path}: {exc}")
+                  out.write(f"> Could not read CSV: {md(exc)}\n\n")
+                  print(f"ERROR reading {path}: {exc}")
                   return
 
               if not headers:
                   out.write("> CSV has no header row.\n\n")
-                  print(f"WARNING: No header row in {path}")
+                  print(f"WARNING: No header row: {path}")
                   return
 
               if not rows:
                   out.write(
-                      "> No data rows found. The CSV contains a header "
-                      "but no records.\n\n"
+                      "> Header exists, but the CSV contains no data rows.\n\n"
                   )
                   print(f"WARNING: Header-only CSV: {path}")
                   return
 
-              selected = [name for name in columns if name in headers]
+              selected = (
+                  [column for column in columns if column in headers]
+                  if columns else headers
+              )
 
               if not selected:
                   selected = headers
 
-              out.write("| " + " | ".join(
-                  markdown_cell(name) for name in selected
-              ) + " |\n")
-
+              out.write("| " + " | ".join(map(md, selected)) + " |\n")
               out.write("| " + " | ".join(
                   "---" for _ in selected
               ) + " |\n")
 
               for row in rows:
                   out.write("| " + " | ".join(
-                      markdown_cell(row.get(name, ""))
-                      for name in selected
+                      md(row.get(column, "")) for column in selected
                   ) + " |\n")
 
               out.write("\n")
               print(
-                  f"Rendered {filename}: {len(rows)} data row(s), "
+                  f"Rendered {filename}: {len(rows)} row(s), "
                   f"{len(selected)} column(s)"
               )
 
-          print(f"Python: {sys.version}")
+          def render_json_status(out):
+              path = run_dir / "target_measurement_status.json"
+              if not path.is_file():
+                  return
+
+              try:
+                  data = json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, json.JSONDecodeError) as exc:
+                  print(f"WARNING: Could not parse {path}: {exc}")
+                  return
+
+              out.write("## Measurement availability\n\n")
+              out.write("| Metric | Status |\n| --- | --- |\n")
+
+              if isinstance(data, dict):
+                  for key, value in data.items():
+                      out.write(f"| {md(key)} | {md(value)} |\n")
+
+              out.write("\n")
+
           print(f"Run directory exists: {run_dir.is_dir()}")
-          print(f"Summary file: {summary_path}")
 
           with summary_path.open("a", encoding="utf-8") as out:
               out.write("# FIR Physical-Design Results\n\n")
@@ -391,7 +407,7 @@ jobs:
 
               render_csv(
                   out,
-                  "FIR Configuration",
+                  "FIR Configuration and Flow Status",
                   "fir_features.csv",
                   [
                       "run_id",
@@ -405,6 +421,12 @@ jobs:
                       "flow_status",
                       "last_completed_stage",
                   ],
+              )
+
+              render_csv(
+                  out,
+                  "Flow Status History",
+                  "fir_features_status.csv",
               )
 
               render_csv(
@@ -480,38 +502,99 @@ jobs:
                   ],
               )
 
+              render_json_status(out)
+
               out.write(
                   "---\n\n"
                   "Generated by the FIR Physical Design workflow.\n"
               )
 
-          print("SUCCESS: Summary Markdown was written.")
+          print("SUCCESS: GitHub Actions summary written.")
           PY
 
-          echo "===== Summary file written ====="
+          echo "===== Summary file ====="
           ls -lh "$SUMMARY_FILE"
-          tail -n 35 "$SUMMARY_FILE"
+          tail -n 40 "$SUMMARY_FILE"
 
-      - name: Display CSV file locations
+      # ------------------------------------------------------
+      # 8. Inspect existing reports and missing measurements
+      # ------------------------------------------------------
+      - name: Inspect timing, routing, and congestion reports
         if: always()
         run: |
-          set -u
+          set -uo pipefail
 
-          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN {
-            sub(/0+$/, "", c)
-            sub(/\.$/, "", c)
-            print c
-          }')"
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" \
+            'BEGIN { printf "%g", c + 0 }')"
+
+          RUN_DIR="fir_project/runs/fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
+
+          if [[ ! -d "$RUN_DIR" ]]; then
+            echo "Run directory not found: $RUN_DIR"
+            exit 0
+          fi
+
+          echo "===== Reports in $RUN_DIR ====="
+
+          find "$RUN_DIR" -type f \
+            \( -iname '*timing*.rpt' \
+               -o -iname '*congestion*' \
+               -o -iname '*route*.log' \
+               -o -iname '*drc*' \
+               -o -name 'flow_diagnostics.log' \
+               -o -name 'fir_features_status.csv' \) \
+            -print | sort
+
+          for f in \
+            "$RUN_DIR/timing_setup.rpt" \
+            "$RUN_DIR/timing_hold.rpt" \
+            "$RUN_DIR/congestion.rpt" \
+            "$RUN_DIR/flow_diagnostics.log" \
+            "$RUN_DIR/fir_features_status.csv"
+          do
+            if [[ -s "$f" ]]; then
+              echo ""
+              echo "========== $f =========="
+              if [[ "$f" == *".csv" || "$f" == *".rpt" ]]; then
+                sed -n '1,120p' "$f"
+              else
+                tail -n 120 "$f"
+              fi
+            fi
+          done
+
+          if [[ -s "$RUN_DIR/openroad_log.txt" ]]; then
+            echo ""
+            echo "===== Routing and timing log matches ====="
+
+            grep -Ein \
+              'Complete detail routing|SUCCESS: Detailed routing|Number of violations|Total wire length|Total number of vias|overflow|congestion|slack|wns|tns' \
+              "$RUN_DIR/openroad_log.txt" || true
+          fi
+
+      # ------------------------------------------------------
+      # 9. Show CSV availability
+      # ------------------------------------------------------
+      - name: Display generated files
+        if: always()
+        run: |
+          set -uo pipefail
+
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" \
+            'BEGIN { printf "%g", c + 0 }')"
 
           RUN_DIR="fir_project/runs/fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
 
           echo "===== Generated CSV files ====="
 
-          for file in \
-            "$RUN_DIR/features.csv" \
-            "$RUN_DIR/fir_features.csv" \
-            "$RUN_DIR/physical_targets.csv" \
-            "$RUN_DIR/preplacement_features.csv"; do
+          for name in \
+            fir_features.csv \
+            fir_features_status.csv \
+            features.csv \
+            physical_targets.csv \
+            preplacement_features.csv
+          do
+            file="$RUN_DIR/$name"
 
             if [[ -s "$file" ]]; then
               echo "AVAILABLE: $file"
@@ -521,53 +604,28 @@ jobs:
             fi
           done
 
-      - name: Inspect timing and routing reports
-        if: always()
-        run: |
-          set -uo pipefail
+          echo ""
+          echo "===== Other important outputs ====="
 
-          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN {
-            sub(/0+$/, "", c)
-            sub(/\.$/, "", c)
-            print c
-          }')"
-
-          RUN_DIR="fir_project/runs/fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
-
-          if [[ ! -d "$RUN_DIR" ]]; then
-            echo "FIR run directory not found: $RUN_DIR"
-            exit 0
-          fi
-
-          echo "Using: $RUN_DIR"
-
-          for f in \
-            timing_setup.rpt \
-            timing_hold.rpt \
-            wns_setup.rpt \
-            tns_setup.rpt \
-            wns_hold.rpt \
-            timing_setup_global_route.rpt \
-            wns_setup_global_route.rpt \
-            tns_setup_global_route.rpt \
+          for name in \
+            final.def \
+            final.odb \
+            openroad_log.txt \
             flow_diagnostics.log \
-            openroad_log.txt
+            run_report.md
           do
-            if [[ -f "$RUN_DIR/$f" ]]; then
-              echo ""
-              echo "========== $f =========="
-              cat "$RUN_DIR/$f"
+            file="$RUN_DIR/$name"
+
+            if [[ -s "$file" ]]; then
+              echo "AVAILABLE: $file"
+            else
+              echo "MISSING OR EMPTY: $file"
             fi
           done
 
-          echo ""
-          echo "========== Routing/congestion keywords =========="
-
-          grep -Ein \
-            'slack|wns|tns|overflow|congestion|wire.?length|total wire|route' \
-            "$RUN_DIR/openroad_log.txt" \
-            "$RUN_DIR/flow_diagnostics.log" 2>/dev/null || true
-
+      # ------------------------------------------------------
+      # 10. Upload artifacts even when a previous step fails
+      # ------------------------------------------------------
       - name: Upload FIR physical-design artifacts
         if: always()
         uses: actions/upload-artifact@v4
