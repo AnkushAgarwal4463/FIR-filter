@@ -5,10 +5,13 @@
 #
 # Required environment:
 # TECH_LEF CELL_LEF LIBERTY NETLIST SDC RUN_DIR UTIL PLACE_DENSITY
+#
+# Optional configuration:
+# TAPS DATA_WIDTH COEFF_WIDTH ACC_WIDTH CLK_PERIOD_NS or CLK_PERIOD
 # ============================================================
 
 # ------------------------------------------------------------
-# 0. Validate environment
+# 0. Validate environment and initialize run directory
 # ------------------------------------------------------------
 foreach var {
     TECH_LEF CELL_LEF LIBERTY NETLIST SDC
@@ -22,6 +25,120 @@ foreach var {
 
 file mkdir $::env(RUN_DIR)
 
+# ------------------------------------------------------------
+# 1. CSV helpers and persistent stage tracking
+# ------------------------------------------------------------
+set ::feature_csv "$::env(RUN_DIR)/fir_features.csv"
+set ::status_csv "$::env(RUN_DIR)/fir_features_status.csv"
+set ::feature_status "IN_PROGRESS"
+set ::last_completed_stage "initialization"
+
+set ::taps ""
+set ::data_width ""
+set ::coeff_width ""
+set ::acc_width ""
+set ::clk_period ""
+
+foreach {env_name variable_name} {
+    TAPS taps
+    DATA_WIDTH data_width
+    COEFF_WIDTH coeff_width
+    ACC_WIDTH acc_width
+} {
+    if {[info exists ::env($env_name)]} {
+        set ::$variable_name $::env($env_name)
+    }
+}
+
+# Accept either clock-period variable name.
+if {[info exists ::env(CLK_PERIOD_NS)] && $::env(CLK_PERIOD_NS) ne ""} {
+    set ::clk_period $::env(CLK_PERIOD_NS)
+} elseif {[info exists ::env(CLK_PERIOD)] && $::env(CLK_PERIOD) ne ""} {
+    set ::clk_period $::env(CLK_PERIOD)
+}
+
+proc csv_escape {value} {
+    set value [string map [list "\"" "\"\""] $value]
+    return "\"$value\""
+}
+
+proc csv_write_row {fd values} {
+    set escaped {}
+    foreach value $values {
+        lappend escaped [csv_escape $value]
+    }
+    puts $fd [join $escaped ","]
+}
+
+proc write_feature_snapshot {} {
+    set header {
+        run_id taps data_width coeff_width acc_width
+        utilization place_density clk_period_ns
+        flow_status last_completed_stage
+    }
+
+    set values [list \
+        [file tail $::env(RUN_DIR)] \
+        $::taps \
+        $::data_width \
+        $::coeff_width \
+        $::acc_width \
+        $::env(UTIL) \
+        $::env(PLACE_DENSITY) \
+        $::clk_period \
+        $::feature_status \
+        $::last_completed_stage \
+    ]
+
+    # Rewrite the snapshot so it always contains exactly one header
+    # row and one data row, even when status changes during the flow.
+    set fd [open $::feature_csv "w"]
+    fconfigure $fd -buffering line
+    csv_write_row $fd $header
+    csv_write_row $fd $values
+    close $fd
+}
+
+proc append_status_history {} {
+    set needs_header 1
+
+    if {[file exists $::status_csv] && [file size $::status_csv] > 0} {
+        set needs_header 0
+    }
+
+    set fd [open $::status_csv "a"]
+    fconfigure $fd -buffering line
+
+    if {$needs_header} {
+        csv_write_row $fd {
+            run_id status last_completed_stage unix_timestamp
+        }
+    }
+
+    csv_write_row $fd [list \
+        [file tail $::env(RUN_DIR)] \
+        $::feature_status \
+        $::last_completed_stage \
+        [clock seconds] \
+    ]
+
+    close $fd
+}
+
+proc update_feature_status {status stage} {
+    set ::feature_status $status
+    set ::last_completed_stage $stage
+
+    write_feature_snapshot
+    append_status_history
+}
+
+# Create initial CSV files before any physical-design steps run.
+update_feature_status "IN_PROGRESS" "initialization"
+
+# ------------------------------------------------------------
+# 2. Diagnostic logging
+# ------------------------------------------------------------
 set ::diag_log "$::env(RUN_DIR)/flow_diagnostics.log"
 set ::diag_fd [open $::diag_log "a"]
 fconfigure $::diag_fd -buffering line
@@ -63,14 +180,20 @@ proc run_step {label script} {
         }
 
         log_msg "Elapsed before failure: [expr {[clock seconds] - $start_time}] seconds"
-        log_msg "Diagnostic log: $::diag_log"
 
+        # Preserve the last successfully completed stage.
+        update_feature_status "FAILED" $::last_completed_stage
+
+        log_msg "Diagnostic log: $::diag_log"
         close_diag_log
+
         return -options $options $result
     }
 
     log_msg "SUCCESS: $label"
     log_msg "Elapsed: [expr {[clock seconds] - $start_time}] seconds"
+
+    update_feature_status "IN_PROGRESS" $label
     return $result
 }
 
@@ -85,10 +208,13 @@ proc optional_step {label script} {
             log_msg [dict get $options -errorinfo]
         }
 
+        # Optional failure does not erase the last successful stage.
+        # The warning remains in flow_diagnostics.log.
         return 0
     }
 
     log_msg "SUCCESS: $label"
+    update_feature_status "IN_PROGRESS" $label
     return 1
 }
 
@@ -105,8 +231,7 @@ proc require_file {path description} {
 }
 
 # ------------------------------------------------------------
-# Startup information
-# Use Unix timestamps; avoid clock format/timezone dependencies.
+# 3. Startup information
 # ------------------------------------------------------------
 log_msg ""
 log_msg "############################################################"
@@ -115,12 +240,15 @@ log_msg "Started (Unix timestamp): [clock seconds]"
 log_msg "RUN_DIR: $::env(RUN_DIR)"
 log_msg "UTIL: $::env(UTIL)"
 log_msg "PLACE_DENSITY: $::env(PLACE_DENSITY)"
+log_msg "CLK_PERIOD_NS: $::clk_period"
 log_msg "NETLIST: $::env(NETLIST)"
 log_msg "SDC: $::env(SDC)"
+log_msg "Feature CSV: $::feature_csv"
+log_msg "Status history: $::status_csv"
 log_msg "############################################################"
 
 # ------------------------------------------------------------
-# 1. Validate input files
+# 4. Validate input files
 # ------------------------------------------------------------
 run_step "Validate input files" {
     foreach var {TECH_LEF CELL_LEF LIBERTY NETLIST SDC} {
@@ -139,7 +267,7 @@ run_step "Validate input files" {
 }
 
 # ------------------------------------------------------------
-# 2. Read technology, libraries, netlist and constraints
+# 5. Read technology, libraries, netlist and constraints
 # ------------------------------------------------------------
 run_step "Read technology LEF" {
     read_lef $::env(TECH_LEF)
@@ -166,7 +294,7 @@ run_step "Read SDC constraints" {
 }
 
 # ------------------------------------------------------------
-# 3. Floorplan and routing setup
+# 6. Floorplan and routing setup
 # ------------------------------------------------------------
 run_step "Initialize floorplan" {
     initialize_floorplan \
@@ -185,14 +313,14 @@ run_step "Configure wire RC" {
 }
 
 # ------------------------------------------------------------
-# 4. Place I/O pins
+# 7. Place I/O pins
 # ------------------------------------------------------------
 run_step "Place I/O pins" {
     place_pins -hor_layers met3 -ver_layers met2
 }
 
 # ------------------------------------------------------------
-# 5. Global placement
+# 8. Global placement
 # ------------------------------------------------------------
 run_step "Global placement" {
     global_placement -density $::env(PLACE_DENSITY)
@@ -203,7 +331,7 @@ optional_step "Save post-global-placement database" {
 }
 
 # ------------------------------------------------------------
-# 6. Design repair and detailed placement
+# 9. Design repair and detailed placement
 # ------------------------------------------------------------
 run_step "Repair design" {
     repair_design
@@ -218,14 +346,14 @@ optional_step "Save post-placement database" {
 }
 
 # ------------------------------------------------------------
-# 7. Setup timing repair
+# 10. Setup timing repair
 # ------------------------------------------------------------
 optional_step "Setup timing repair" {
     repair_timing -setup -setup_margin 0.2
 }
 
 # ------------------------------------------------------------
-# 8. Global routing
+# 11. Global routing
 # ------------------------------------------------------------
 run_step "Global routing" {
     global_route \
@@ -241,7 +369,7 @@ optional_step "Estimate global-route parasitics" {
 }
 
 # ------------------------------------------------------------
-# 9. Global-route timing reports
+# 12. Global-route timing reports
 # ------------------------------------------------------------
 optional_step "Global-route setup timing report" {
     report_checks \
@@ -261,7 +389,7 @@ optional_step "Global-route TNS report" {
 }
 
 # ------------------------------------------------------------
-# 10. Detailed routing
+# 13. Detailed routing
 # ------------------------------------------------------------
 run_step "Detailed routing" {
     detailed_route
@@ -272,7 +400,7 @@ optional_step "Save post-detailed-routing database" {
 }
 
 # ------------------------------------------------------------
-# 11. Save and validate final design
+# 14. Save and validate final design
 # ------------------------------------------------------------
 run_step "Write final DEF" {
     write_def "$::env(RUN_DIR)/final.def"
@@ -288,7 +416,7 @@ run_step "Validate final design artifacts" {
 }
 
 # ------------------------------------------------------------
-# 12. Final timing and area reports
+# 15. Final timing and area reports
 # ------------------------------------------------------------
 optional_step "Final setup timing report" {
     report_checks \
@@ -325,7 +453,7 @@ optional_step "Final design area report" {
 }
 
 # ------------------------------------------------------------
-# 13. Completion summary
+# 16. Completion summary
 # ------------------------------------------------------------
 log_msg ""
 log_msg "############################################################"
@@ -335,94 +463,5 @@ log_msg "Results directory: $::env(RUN_DIR)"
 log_msg "Diagnostic log: $::diag_log"
 log_msg "############################################################"
 
+update_feature_status "COMPLETED" "flow_completed"
 close_diag_log
-
-# ------------------------------------------------------------
-# Feature CSV: configuration and flow status
-# ------------------------------------------------------------
-
-set ::feature_csv "$::env(RUN_DIR)/fir_features.csv"
-set ::feature_status "IN_PROGRESS"
-
-proc csv_escape {value} {
-    set value [string map [list "\"" "\"\""] $value]
-    return "\"$value\""
-}
-
-proc write_feature_row {path values} {
-    set fd [open $path "w"]
-    fconfigure $fd -buffering line
-
-    set escaped {}
-    foreach value $values {
-        lappend escaped [csv_escape $value]
-    }
-
-    puts $fd [join $escaped ","]
-    close $fd
-}
-
-# Add these environment variables in the runner if available.
-set taps ""
-set data_width ""
-set coeff_width ""
-set acc_width ""
-set clk_period ""
-
-foreach {env_name variable_name} {
-    TAPS taps
-    DATA_WIDTH data_width
-    COEFF_WIDTH coeff_width
-    ACC_WIDTH acc_width
-    CLK_PERIOD_NS clk_period
-} {
-    if {[info exists ::env($env_name)]} {
-        set $variable_name $::env($env_name)
-    }
-}
-
-# A first snapshot ensures that a CSV exists before routing.
-set feature_header {
-    run_id taps data_width coeff_width acc_width
-    utilization place_density clk_period_ns
-    flow_status last_completed_stage
-}
-
-set feature_values [list \
-    [file tail $::env(RUN_DIR)] \
-    $taps $data_width $coeff_width $acc_width \
-    $::env(UTIL) $::env(PLACE_DENSITY) $clk_period \
-    $::feature_status "CSV_INITIALIZED" \
-]
-
-write_feature_row $::feature_csv $feature_header
-set ::feature_csv_fd [open $::feature_csv "a"]
-fconfigure $::feature_csv_fd -buffering line
-
-set ::feature_header_written 1
-
-proc update_feature_status {status stage} {
-    global feature_csv feature_csv_fd
-
-    # Append an audit record to a separate file so the CSV
-    # remains a single-row dataset with a stable column schema.
-    set status_file "[file rootname $feature_csv]_status.csv"
-    set is_new [expr {![file exists $status_file]}]
-    set fd [open $status_file "a"]
-    fconfigure $fd -buffering line
-
-    if {$is_new} {
-        puts $fd "run_id,status,last_completed_stage,unix_timestamp"
-    }
-
-    set row [list \
-        [file tail $::env(RUN_DIR)] \
-        $status $stage [clock seconds]]
-
-    set escaped {}
-    foreach value $row {
-        lappend escaped [csv_escape $value]
-    }
-    puts $fd [join $escaped ","]
-    close $fd
-}
