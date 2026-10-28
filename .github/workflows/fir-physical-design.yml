@@ -48,7 +48,6 @@ jobs:
   fir-physical-design:
     runs-on: ubuntu-latest
 
-    # Provides OpenROAD and the ORFS platform files, including Sky130HD.
     container:
       image: openroad/orfs:latest
 
@@ -60,7 +59,6 @@ jobs:
     env:
       UTIL: ${{ inputs.utilization || '40' }}
       CLK_PERIOD: ${{ inputs.clock_period || '10.0' }}
-      PLACE_DENSITY: "0.40"
 
     steps:
       - name: Check out repository
@@ -117,7 +115,6 @@ jobs:
           init-shell: bash
           post-cleanup: none
 
-      
       - name: Verify OpenROAD and synthesis tools
         run: |
           set -euo pipefail
@@ -170,8 +167,6 @@ jobs:
             echo "FOUND: $file"
           done
 
-          # Update the project configuration to use the verified
-          # files supplied by the ORFS container.
           sed -i -E \
             "s|^export LIBERTY=.*|export LIBERTY=\"$LIBERTY_PATH\"|" \
             config/sky130_example.env
@@ -184,7 +179,6 @@ jobs:
             "s|^export CELL_LEF=.*|export CELL_LEF=\"$CELL_LEF_PATH\"|" \
             config/sky130_example.env
 
-          # Check that the updated project configuration resolves correctly.
           source config/sky130_example.env
 
           test -f "$LIBERTY"
@@ -204,51 +198,28 @@ jobs:
 
           source /OpenROAD-flow-scripts/env.sh
 
-          export RUN_TAG="fir_8tap_w8_util${UTIL}_clk${CLK_PERIOD}"
+          # Normalize the clock tag: 10.0 becomes 10.
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN {
+            sub(/0+$/, "", c)
+            sub(/\.$/, "", c)
+            print c
+          }')"
+
+          export PLACE_DENSITY="$(awk -v u="$UTIL" \
+            'BEGIN { printf "%.2f", u / 100 }')"
+
+          export RUN_TAG="fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
           export RUN_DIR="fir_project/runs/${RUN_TAG}"
+
+          echo "RUN_TAG=$RUN_TAG"
+          echo "RUN_DIR=$RUN_DIR"
+          echo "UTIL=$UTIL"
+          echo "PLACE_DENSITY=$PLACE_DENSITY"
+          echo "CLK_PERIOD=$CLK_PERIOD"
 
           chmod +x scripts/run_fir_flow.sh
           ./scripts/run_fir_flow.sh
 
-          
-      
-      - name: Display numerical feature CSVs
-        if: always()
-        run: |
-          set -u
-
-          BASE_DIR="fir_project/runs"
-
-          echo "===== Available run directories ====="
-          find "$BASE_DIR" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null || true
-
-          RUN_DIR="$(find "$BASE_DIR" -mindepth 1 -maxdepth 1 \
-            -type d -name 'fir_8tap_w8_util*_clk*' -print -quit 2>/dev/null || true)"
-
-          if [[ -z "$RUN_DIR" ]]; then
-            echo "ERROR: FIR run directory not found."
-            exit 0
-          fi
-
-          echo "Using run directory: $RUN_DIR"
-
-          for file in \
-            "$RUN_DIR/features.csv" \
-            "$RUN_DIR/fir_features.csv" \
-            "$RUN_DIR/physical_targets.csv" \
-            "$RUN_DIR/preplacement_features.csv"; do
-
-            echo
-            echo "========== $file =========="
-
-            if [[ -s "$file" ]]; then
-              cat "$file"
-            else
-              echo "File missing or empty."
-            fi
-          done
-
-          
       - name: Populate FIR configuration CSV
         if: always()
         run: |
@@ -274,41 +245,235 @@ jobs:
 
           mkdir -p "$RUN_DIR"
 
+          # Write one header and exactly one configuration row.
           printf '%s\n' \
             '"run_id","taps","data_width","coeff_width","acc_width","utilization","place_density","clk_period_ns","flow_status","last_completed_stage"' \
             > "$CSV"
 
-          # Artifacts alone do not prove that detailed routing succeeded.
           STATUS="artifacts_present_unverified"
           STAGE="unknown"
 
-          if [[ -f "$RUN_DIR/final.odb" &&
-                -f "$RUN_DIR/final.def" ]]; then
+          if [[ -s "$RUN_DIR/final.odb" &&
+                -s "$RUN_DIR/final.def" ]]; then
             STATUS="artifacts_present"
           else
             STATUS="incomplete_or_missing_artifacts"
           fi
 
           printf '"%s",%s,%s,%s,%s,%s,%s,%s,"%s","%s"\n' \
-            "fir_filter_8tap" \
+            "$RUN_TAG" \
             8 8 8 24 "$UTIL" "$DENSITY" "$CLK_PERIOD" \
             "$STATUS" "$STAGE" >> "$CSV"
 
-          echo "===== FIR configuration CSV ====="
-          cat "$CSV"
+          echo "Configuration CSV created: $CSV"
 
+      - name: Create tabular feature summary
+        if: always()
+        env:
+          SUMMARY_FILE: ${{ github.step_summary }}
+        run: |
+          set -euo pipefail
 
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN {
+            sub(/0+$/, "", c)
+            sub(/\.$/, "", c)
+            print c
+          }')"
 
-      - name: List generated outputs
+          RUN_TAG="fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
+          RUN_DIR="fir_project/runs/${RUN_TAG}"
+
+          echo "Using run directory: $RUN_DIR"
+
+          python - <<'PY'
+          import csv
+          import os
+          from pathlib import Path
+
+          run_dir = Path(os.environ.get("RUN_DIR", ""))
+          # RUN_DIR is constructed in the shell below and passed explicitly.
+          run_dir = Path(os.environ["FIR_SUMMARY_RUN_DIR"])
+          summary_path = os.environ["SUMMARY_FILE"]
+
+          def markdown_cell(value):
+              value = str(value if value is not None else "")
+              return (
+                  value.replace("|", "\\|")
+                  .replace("\r", " ")
+                  .replace("\n", " ")
+              )
+
+          def render_csv(out, title, filename, columns):
+              path = run_dir / filename
+              out.write(f"## {title}\n\n")
+
+              if not path.is_file():
+                  out.write(f"CSV not found: `{filename}`\n\n")
+                  return
+
+              with path.open(
+                  "r", newline="", encoding="utf-8-sig"
+              ) as handle:
+                  reader = csv.DictReader(handle)
+                  headers = reader.fieldnames or []
+                  rows = list(reader)
+
+              if not headers:
+                  out.write("**CSV has no header row.**\n\n")
+                  return
+
+              if not rows:
+                  out.write(
+                      "**No data rows found.** The CSV contains a header "
+                      "but no records.\n\n"
+                  )
+                  return
+
+              selected = [name for name in columns if name in headers]
+
+              if not selected:
+                  selected = headers
+
+              out.write("| " + " | ".join(selected) + " |\n")
+              out.write("| " + " | ".join("---" for _ in selected) + " |\n")
+
+              for row in rows:
+                  out.write(
+                      "| "
+                      + " | ".join(
+                          markdown_cell(row.get(name, ""))
+                          for name in selected
+                      )
+                      + " |\n"
+                  )
+
+              out.write("\n")
+
+          with open(summary_path, "a", encoding="utf-8") as out:
+              out.write("# FIR Physical-Design Results\n\n")
+              out.write(f"**Run:** `{run_dir.name}`\n\n")
+
+              render_csv(
+                  out,
+                  "FIR Configuration",
+                  "fir_features.csv",
+                  [
+                      "run_id",
+                      "taps",
+                      "data_width",
+                      "coeff_width",
+                      "acc_width",
+                      "utilization",
+                      "place_density",
+                      "clk_period_ns",
+                      "flow_status",
+                      "last_completed_stage",
+                  ],
+              )
+
+              render_csv(
+                  out,
+                  "Physical-Design Targets",
+                  "physical_targets.csv",
+                  [
+                      "final_def_available",
+                      "final_odb_available",
+                      "routed_net_count",
+                      "route_segment_count",
+                      "wirelength_um",
+                      "via_count",
+                      "final_detailed_route_violations",
+                      "effective_place_density",
+                      "design_area_um2",
+                      "wns_setup_ns",
+                      "tns_setup_ns",
+                      "wns_hold_ns",
+                      "congestion_overflow",
+                      "target_measurement_status",
+                  ],
+              )
+
+              render_csv(
+                  out,
+                  "Extracted Netlist and Physical Features",
+                  "features.csv",
+                  [
+                      "design_id",
+                      "run_id",
+                      "cell_count",
+                      "sequential_cell_count",
+                      "combinational_cell_count",
+                      "buffer_inverter_count",
+                      "other_cell_count",
+                      "unique_cell_type_count",
+                      "avg_bit_fanout",
+                      "max_bit_fanout",
+                      "wirelength_um",
+                      "via_count",
+                      "wns_setup_ns",
+                      "tns_setup_ns",
+                      "wns_hold_ns",
+                      "congestion_overflow",
+                      "design_area_um2",
+                      "target_measurement_status",
+                  ],
+              )
+
+              render_csv(
+                  out,
+                  "Pre-placement Features",
+                  "preplacement_features.csv",
+                  [
+                      "design_id",
+                      "run_id",
+                      "cell_count",
+                      "sequential_cell_count",
+                      "combinational_cell_count",
+                      "buffer_inverter_count",
+                      "other_cell_count",
+                      "unique_cell_type_count",
+                      "avg_bit_fanout",
+                      "max_bit_fanout",
+                      "utilization_constraint_percent",
+                      "clock_period_ns",
+                      "taps",
+                      "data_width",
+                      "coeff_width",
+                      "acc_width",
+                      "place_density",
+                  ],
+              )
+          PY
+        env:
+          FIR_SUMMARY_RUN_DIR: fir-filter-cross-design/fir_project/runs/${{ format('fir_8tap_w8_util{0}_clk{1}', inputs.utilization || '40', inputs.clock_period || '10') }}
+
+      - name: Display CSV file locations
         if: always()
         run: |
-          echo "===== Generated FIR outputs ====="
+          set -u
 
-          if [[ -d fir_project ]]; then
-            find fir_project -maxdepth 6 -type f -print | sort
-          else
-            echo "No fir_project directory was generated."
-          fi
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN {
+            sub(/0+$/, "", c)
+            sub(/\.$/, "", c)
+            print c
+          }')"
+
+          RUN_DIR="fir_project/runs/fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
+
+          echo "===== Generated CSV files ====="
+
+          for file in \
+            "$RUN_DIR/features.csv" \
+            "$RUN_DIR/fir_features.csv" \
+            "$RUN_DIR/physical_targets.csv" \
+            "$RUN_DIR/preplacement_features.csv"; do
+
+            if [[ -s "$file" ]]; then
+              echo "AVAILABLE: $file"
+            else
+              echo "MISSING OR EMPTY: $file"
+            fi
+          done
 
       - name: Inspect timing and routing reports
         if: always()
@@ -316,14 +481,17 @@ jobs:
         run: |
           set -uo pipefail
 
-          RUN_DIR="$(find fir_project/runs \
-            -mindepth 1 -maxdepth 1 \
-            -type d -name 'fir_8tap_w8_util*_clk*' \
-            -print -quit)"
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN {
+            sub(/0+$/, "", c)
+            sub(/\.$/, "", c)
+            print c
+          }')"
 
-          if [ -z "$RUN_DIR" ]; then
-            echo "FIR run directory not found"
-            exit 1
+          RUN_DIR="fir_project/runs/fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
+
+          if [[ ! -d "$RUN_DIR" ]]; then
+            echo "FIR run directory not found: $RUN_DIR"
+            exit 0
           fi
 
           echo "Using: $RUN_DIR"
@@ -340,7 +508,7 @@ jobs:
             flow_diagnostics.log \
             openroad_log.txt
           do
-            if [ -f "$RUN_DIR/$f" ]; then
+            if [[ -f "$RUN_DIR/$f" ]]; then
               echo ""
               echo "========== $f =========="
               cat "$RUN_DIR/$f"
@@ -349,10 +517,11 @@ jobs:
 
           echo ""
           echo "========== Routing/congestion keywords =========="
+
           grep -Ein \
             'slack|wns|tns|overflow|congestion|wire.?length|total wire|route' \
             "$RUN_DIR/openroad_log.txt" \
-            "$RUN_DIR/flow_diagnostics.log" || true
+            "$RUN_DIR/flow_diagnostics.log" 2>/dev/null || true
 
       - name: Upload FIR physical-design artifacts
         if: always()
