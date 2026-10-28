@@ -708,78 +708,6 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
 # Configuration CSV and flow-status detection
 # ============================================================
 
-def write_configuration_csv(
-    outdir: Path,
-    run_dir: Path,
-    args: argparse.Namespace,
-    post: dict[str, Any],
-) -> None:
-    """
-    Detect status using log markers and artifacts.
-
-    The deprecated --flow-status argument cannot override detected status.
-    """
-    run_id = args.run_id or run_dir.name
-
-    def_ok = bool(
-        post["final_def_available"]
-        and post["final_def_nonempty"]
-    )
-    odb_ok = bool(post["final_odb_available"])
-    route_success = bool(
-        post["detailed_route_success_marker_found"]
-    )
-
-    if route_success and def_ok and odb_ok:
-        flow_status = "detailed_routing_completed"
-        last_stage = "detailed_routing"
-    elif def_ok and odb_ok:
-        flow_status = "artifacts_present"
-        last_stage = "unknown"
-    elif def_ok or odb_ok:
-        flow_status = "partial_artifacts"
-        last_stage = "unknown"
-    elif post.get("log_files_found"):
-        flow_status = "flow_incomplete_or_unverified"
-        last_stage = "unknown"
-    else:
-        flow_status = "no_artifacts_or_logs"
-        last_stage = "unknown"
-
-    fields = [
-        "run_id",
-        "taps",
-        "data_width",
-        "coeff_width",
-        "acc_width",
-        "utilization",
-        "place_density",
-        "clk_period_ns",
-        "flow_status",
-        "last_completed_stage",
-    ]
-
-    row = {
-        "run_id": run_id,
-        "taps": args.taps,
-        "data_width": args.data_width,
-        "coeff_width": args.coeff_width,
-        "acc_width": args.acc_width,
-        "utilization": args.utilization,
-        "place_density": args.place_density,
-        "clk_period_ns": args.clock_period,
-        "flow_status": flow_status,
-        "last_completed_stage": last_stage,
-    }
-
-    write_rows_csv(outdir / "fir_features.csv", fields, row)
-
-    print(f"Detected flow status: {flow_status}")
-    print(f"Last completed stage: {last_stage}")
-    print(f"Routing success marker: {route_success}")
-    print(f"Final DEF nonempty: {def_ok}")
-    print(f"Final ODB nonempty: {odb_ok}")
-
 
 def write_human_report(
     outdir: Path,
@@ -788,11 +716,11 @@ def write_human_report(
     args: argparse.Namespace,
     run_dir: Path,
 ) -> None:
-    """Write an engineering summary of extracted FIR results."""
+    """Write a readable engineering report with assessments and actions."""
 
     def fmt(value: Any, unit: str = "") -> str:
         if value is None:
-            return "Unavailable (not extracted)"
+            return "Unavailable"
         if isinstance(value, bool):
             return "Yes" if value else "No"
         if isinstance(value, float):
@@ -801,54 +729,108 @@ def write_human_report(
 
     def assess(metric: str, value: Any) -> str:
         if value is None:
-            return "Cannot assess: metric unavailable"
-
+            return "Not assessed: metric unavailable"
         if metric in ("wns_setup_ns", "wns_hold_ns"):
-            return "PASS: non-negative slack" if value >= 0 else "FAIL: negative slack"
-
+            return "Non-negative slack" if value >= 0 else "Negative slack: investigate"
         if metric == "tns_setup_ns":
-            return "PASS: zero TNS" if value == 0 else (
-                "Investigate negative setup slack"
-                if value < 0 else
-                "Check report semantics; TNS is unexpectedly positive"
+            return "Zero setup TNS" if value == 0 else (
+                "Negative TNS: investigate" if value < 0
+                else "Unexpected positive TNS: verify parser"
             )
-
         if metric == "final_detailed_route_violations":
-            return "No reported violations" if value == 0 else "Investigate routing violations"
-
+            return "Zero reported violations" if value == 0 else "Investigate reported violations"
         if metric == "congestion_overflow":
-            return "No reported overflow" if value == 0 else "Compare against baseline and tool definition"
-
+            return "Zero reported overflow" if value == 0 else "Compare with baseline and tool definition"
+        if metric == "avg_bit_fanout":
+            return "Extracted fanout" if value is not None else "Input-port direction metadata missing"
+        if metric in ("cell_count", "sequential_cell_count",
+                      "combinational_cell_count", "unique_cell_type_count"):
+            return "Informational; cell classification is heuristic"
         if metric in ("wirelength_um", "via_count", "design_area_um2"):
-            return "Compare with other configurations; lower is not always better"
+            return "Compare across runs using the same extraction method"
+        if metric == "effective_place_density":
+            return "Verify whether this is target or achieved density"
+        return "Verify metric definition and source"
 
-        return "Informational; verify against flow configuration"
+    def action(metric: str, value: Any) -> str:
+        if value is None:
+            if metric == "congestion_overflow":
+                return "Inspect the OpenROAD congestion report/log and add a parser for its actual format."
+            if metric == "avg_bit_fanout":
+                return "Check whether the Yosys JSON contains cell port_directions; otherwise enrich the netlist metadata."
+            if metric == "effective_place_density":
+                return "Inspect placement logs and distinguish requested density from achieved utilization."
+            if metric in ("wns_setup_ns", "tns_setup_ns", "wns_hold_ns"):
+                return "Inspect the corresponding timing report and verify the parser matched the correct check."
+            return "Inspect the source report/log; keep this value null until it can be extracted reliably."
+
+        if metric in ("wns_setup_ns", "wns_hold_ns") and value < 0:
+            return "Inspect violating paths and check constraints before attempting timing repair."
+        if metric == "tns_setup_ns" and value < 0:
+            return "Inspect setup violations and confirm the report's TNS units and semantics."
+        if metric == "final_detailed_route_violations" and value != 0:
+            return "Review detailed-routing violations and rerun checks after any repair."
+        if metric == "congestion_overflow" and value != 0:
+            return "Identify congested regions and compare placement/routing settings."
+        if metric in ("wirelength_um", "via_count", "design_area_um2"):
+            return "Compare with other configurations; do not optimize this metric in isolation."
+        if metric == "effective_place_density":
+            return "Confirm the metric definition before using it as an ML target."
+        if metric == "avg_bit_fanout":
+            return "Check fanout distribution and investigate high-fanout nets."
+        if metric in ("cell_count", "sequential_cell_count",
+                      "combinational_cell_count", "unique_cell_type_count"):
+            return "Validate cell categories against Liberty metadata before research use."
+        return "Retain the result and validate against the source report."
+
+    # Match the status logic used by write_configuration_csv().
+    def flow_status() -> tuple[str, str]:
+        def_ok = bool(
+            post.get("final_def_available")
+            and post.get("final_def_nonempty")
+        )
+        odb_ok = bool(post.get("final_odb_available"))
+        route_success = bool(post.get("detailed_route_success_marker_found"))
+
+        if route_success and def_ok and odb_ok:
+            return "detailed_routing_completed", "detailed_routing"
+        if def_ok and odb_ok:
+            return "artifacts_present", "unknown"
+        if def_ok or odb_ok:
+            return "partial_artifacts", "unknown"
+        if post.get("log_files_found"):
+            return "flow_incomplete_or_unverified", "unknown"
+        return "no_artifacts_or_logs", "unknown"
 
     metrics = [
-        ("cell_count", "Synthesis cell count", pre.get("cell_count"), "", "Number of mapped cell instances in the synthesized netlist."),
-        ("sequential_cell_count", "Sequential cells", pre.get("sequential_cell_count"), "", "Heuristic classification; validate against Liberty."),
-        ("combinational_cell_count", "Combinational cells", pre.get("combinational_cell_count"), "", "Heuristic classification; validate against Liberty."),
-        ("unique_cell_type_count", "Unique cell types", pre.get("unique_cell_type_count"), "", "Number of distinct cell types."),
-        ("avg_bit_fanout", "Average bit fanout", pre.get("avg_bit_fanout"), "", "Unavailable when cell-port directions are missing."),
-        ("effective_place_density", "Effective placement density", post.get("effective_place_density"), "", "Extracted density; not necessarily the achieved final utilization."),
-        ("design_area_um2", "Reported design area", post.get("design_area_um2"), " µm²", "Confirm whether this is cell area or another area definition."),
-        ("wirelength_um", "Reported routed wirelength", post.get("wirelength_um"), " µm", "DEF/log-derived value; extraction method may be approximate."),
-        ("via_count", "Reported via count", post.get("via_count"), "", "Compare across configurations using the same extraction method."),
-        ("wns_setup_ns", "Setup worst negative slack (WNS)", post.get("wns_setup_ns"), " ns", "Positive slack is encouraging if the timing report and constraints are valid."),
-        ("tns_setup_ns", "Setup total negative slack (TNS)", post.get("tns_setup_ns"), " ns", "Zero usually indicates no negative setup slack in the reported checks."),
-        ("wns_hold_ns", "Hold worst negative slack (WNS)", post.get("wns_hold_ns"), " ns", "Non-negative slack is encouraging if all required hold checks are covered."),
-        ("congestion_overflow", "Routing congestion overflow", post.get("congestion_overflow"), "", "Do not infer low congestion when this metric is unavailable."),
-        ("final_detailed_route_violations", "Extracted detailed-route violations", post.get("final_detailed_route_violations"), "", "Not equivalent to independent signoff DRC."),
+        ("cell_count", "Synthesis cell count", pre.get("cell_count"), "", "Mapped cell instances in the synthesized netlist."),
+        ("sequential_cell_count", "Sequential cells", pre.get("sequential_cell_count"), "", "Cells classified as sequential using name patterns."),
+        ("combinational_cell_count", "Combinational cells", pre.get("combinational_cell_count"), "", "Cells classified as combinational using name patterns."),
+        ("unique_cell_type_count", "Unique cell types", pre.get("unique_cell_type_count"), "", "Number of distinct mapped cell types."),
+        ("avg_bit_fanout", "Average bit fanout", pre.get("avg_bit_fanout"), "", "Average sink count per included net bit."),
+        ("effective_place_density", "Effective placement density", post.get("effective_place_density"), "", "Density value extracted from logs; may be a requested setting."),
+        ("design_area_um2", "Reported design area", post.get("design_area_um2"), " µm²", "Area reported by the matched log pattern; verify its exact definition."),
+        ("wirelength_um", "Routed wirelength", post.get("wirelength_um"), " µm", "Wirelength extracted from routing logs."),
+        ("via_count", "Via count", post.get("via_count"), "", "Via count extracted from routing logs."),
+        ("wns_setup_ns", "Setup WNS", post.get("wns_setup_ns"), " ns", "Worst setup slack extracted from a report or fallback logs."),
+        ("tns_setup_ns", "Setup TNS", post.get("tns_setup_ns"), " ns", "Total negative setup slack extracted from a report or fallback logs."),
+        ("wns_hold_ns", "Hold WNS", post.get("wns_hold_ns"), " ns", "Worst hold slack extracted from a report or fallback logs."),
+        ("congestion_overflow", "Congestion overflow", post.get("congestion_overflow"), "", "Overflow metric, if recognized in the report or logs."),
+        ("final_detailed_route_violations", "Detailed-route violations", post.get("final_detailed_route_violations"), "", "Extracted router violations; not independent signoff DRC."),
     ]
+
+    detected_status, last_stage = flow_status()
+    run_id = args.run_id or run_dir.name
 
     lines = [
         "# FIR Physical Design Run Report",
         "",
-        f"- **Run ID:** `{args.run_id or run_dir.name}`",
+        f"- **Run ID:** `{run_id}`",
         f"- **Design ID:** `{args.design_id}`",
         f"- **Top module:** `{pre.get('top_module')}`",
         f"- **Run directory:** `{run_dir}`",
-        f"- **Flow status:** `{('detailed routing completion marker found' if post.get('detailed_route_success_marker_found') else 'completion not independently verified')}`",
+        f"- **Detected flow status:** `{detected_status}`",
+        f"- **Last completed stage:** `{last_stage}`",
         "",
         "## Configuration",
         "",
@@ -862,61 +844,53 @@ def write_human_report(
         f"| Requested placement density | {fmt(args.place_density)} |",
         f"| Clock period | {fmt(args.clock_period, ' ns')} |",
         "",
-        "## Metrics and assessment",
+        "## Metrics, meaning, assessment and recommended action",
         "",
-        "| Tag | Value | Meaning | Assessment |",
-        "|---|---:|---|---|",
+        "| Tag | Value | Meaning | Assessment | Recommended action |",
+        "|---|---:|---|---|---|",
     ]
-
-    meanings = {item[0]: item[4] for item in metrics}
 
     for key, label, value, unit, meaning in metrics:
         lines.append(
-            f"| `{key}` ({label}) | {fmt(value, unit)} | "
-            f"{meaning} | {assess(key, value)} |"
+            f"| `{key}` ({label}) | {fmt(value, unit)} | {meaning} | "
+            f"{assess(key, value)} | {action(key, value)} |"
         )
 
-    missing = [
-        key for key, _, value, _, _ in metrics if value is None
-    ]
+    missing = [key for key, _, value, _, _ in metrics if value is None]
 
-    lines.extend([
-        "",
-        "## Required follow-up",
-        "",
-    ])
+    lines.extend(["", "## Artifact checks", ""])
+    lines.append(f"- Final DEF available: {fmt(post.get('final_def_available'))}")
+    lines.append(f"- Final DEF nonempty: {fmt(post.get('final_def_nonempty'))}")
+    lines.append(f"- Final ODB available: {fmt(post.get('final_odb_available'))}")
+    lines.append(
+        "- Detailed-route success marker: "
+        f"{fmt(post.get('detailed_route_success_marker_found'))}"
+    )
 
+    lines.extend(["", "## Required follow-up", ""])
     if missing:
-        lines.append("The following metrics could not be extracted:")
+        lines.append("Metrics not extracted:")
         lines.extend(f"- `{key}`" for key in missing)
-        lines.append(
-            "- Inspect the corresponding OpenROAD report or log and "
-            "update the extractor to match its actual format."
-        )
     else:
-        lines.append(
-            "All metrics listed above were extracted. Validate their "
-            "definitions and units before using them for research conclusions."
-        )
+        lines.append("All listed metrics have values. Validate their definitions and units before drawing research conclusions.")
 
     lines.extend([
         "",
         "## Extraction caveats",
         "",
-        f"- Fanout extraction: {pre.get('fanout_method', 'unknown')}.",
+        f"- Fanout method: {pre.get('fanout_method', 'unknown')}.",
         f"- Cell classification: {pre.get('cell_classification_method', 'unknown')}.",
         f"- Routing note: {post.get('note', 'No note provided')}",
-        "- A single run cannot establish optimization quality. Compare "
-        "multiple configurations under consistent constraints.",
-        "- For ML, keep post-placement/routing outcomes out of predictor "
-        "features when predicting those same outcomes.",
+        "- DEF-derived route counts may be approximate.",
+        "- Router-reported zero violations does not establish independent signoff DRC closure.",
+        "- A single run cannot establish optimization quality; compare configurations under consistent constraints.",
+        "- Exclude post-placement/routing targets from predictor features when predicting those same outcomes.",
         "",
     ])
 
     (outdir / "run_report.md").write_text(
         "\n".join(lines), encoding="utf-8"
     )
-
 
 
 # ============================================================
@@ -1008,11 +982,12 @@ def main() -> int:
         write_json(outdir / "features.json", combined)
         write_csv(outdir / "features.csv", combined)
 
-        write_configuration_csv(
+        write_human_report(
             outdir,
-            run_dir,
-            args,
+            pre,
             post,
+            args,
+            run_dir,
         )
 
         status = {
@@ -1078,7 +1053,7 @@ def main() -> int:
     )
     print(
         "           features.csv, fir_features.csv, "
-        "extraction_status.json"
+        "extraction_status.json, run_report.md"
     )
     print("\nExtraction finished.")
     return 0
