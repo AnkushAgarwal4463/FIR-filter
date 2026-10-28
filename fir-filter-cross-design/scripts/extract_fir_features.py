@@ -1,15 +1,14 @@
-
 #!/usr/bin/env python3
-"""Extract FIR synthesis features and OpenROAD physical targets.
+"""
+Multi-run FIR feature extraction and dataset builder.
 
-Outputs:
-  preplacement_features.csv / .json
-  physical_targets.csv / .json
-  features.csv / .json
-  fir_features.csv
-  extraction_status.json
+Requires:
+    extract_fir_features_readable.py
+    Python 3.10+
+    openpyxl (optional, for Excel output)
 
-Unavailable metrics remain null; values are not fabricated.
+The manifest CSV specifies one row per design/run.
+Existing OpenROAD results are read; the physical-design flow is not rerun.
 """
 
 from __future__ import annotations
@@ -18,897 +17,299 @@ import argparse
 import csv
 import json
 import math
-import re
 import sys
-from collections import Counter
 from pathlib import Path
-from statistics import mean, pstdev
 from typing import Any
 
-NUM = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
-
-SEQ_RE = re.compile(
-    r"(?:sky130_fd_sc_hd__(?:df|sd|ed|sdf)|"
-    r"\b(?:dfrtp|dfrbp|dfrtn|dfr|dff|flipflop|latch)\b)",
-    re.I,
-)
-BUF_RE = re.compile(r"(?:buf|inv|clkbuf)", re.I)
-COMB_RE = re.compile(
-    r"(?:and|or|xor|xnor|mux|maj|fa|ha|aoi|oai|nand|nor|"
-    r"add|sub|mul|alu|logic|cmp)",
-    re.I,
-)
+import extract_fir_features_readable as base
 
 
-# ============================================================
+# ---------------------------------------------------------------------
 # General helpers
-# ============================================================
+# ---------------------------------------------------------------------
 
-def read_text(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return ""
+def read_manifest(path: Path) -> list[dict[str, str]]:
+    """Read and validate the run manifest."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Manifest CSV not found: {path}")
+
+    with path.open("r", newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames:
+            raise ValueError("Manifest CSV has no header.")
+
+        required = {"run_dir", "netlist_json"}
+        missing = required - set(reader.fieldnames)
+        if missing:
+            raise ValueError(
+                "Manifest is missing required columns: "
+                + ", ".join(sorted(missing))
+            )
+
+        rows = []
+        for line_number, row in enumerate(reader, start=2):
+            if not row.get("run_dir", "").strip():
+                raise ValueError(
+                    f"Manifest line {line_number}: run_dir is empty."
+                )
+            if not row.get("netlist_json", "").strip():
+                raise ValueError(
+                    f"Manifest line {line_number}: netlist_json is empty."
+                )
+            rows.append({
+                str(k).strip(): (v.strip() if isinstance(v, str) else "")
+                for k, v in row.items()
+                if k is not None
+            })
+
+    if not rows:
+        raise ValueError("Manifest contains no runs.")
+
+    return rows
 
 
-def finite_float(value: Any) -> float | None:
-    try:
-        value = float(value)
-        return value if math.isfinite(value) else None
-    except (TypeError, ValueError, OverflowError):
+def optional_int(row: dict[str, str], key: str) -> int | None:
+    value = row.get(key, "").strip()
+    if not value:
+        return None
+    result = int(value)
+    if result <= 0:
+        raise ValueError(f"{key} must be a positive integer.")
+    return result
+
+
+def optional_float(row: dict[str, str], key: str) -> float | None:
+    value = row.get(key, "").strip()
+    if not value:
         return None
 
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{key} must be a finite number.")
 
-def write_json(path: Path, data: dict[str, Any]) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, allow_nan=False)
-        f.write("\n")
+    if key == "utilization" and not 0 < result <= 100:
+        raise ValueError("utilization must be greater than 0 and <= 100.")
+    if key == "place_density" and not 0 < result <= 1:
+        raise ValueError("place_density must be greater than 0 and <= 1.")
+    if key == "clock_period" and result <= 0:
+        raise ValueError("clock_period must be positive.")
+
+    return result
 
 
-def write_csv(path: Path, data: dict[str, Any]) -> None:
-    flat = {
-        key: value
-        for key, value in data.items()
-        if not isinstance(value, (dict, list, tuple))
-    }
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(flat))
+def write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(obj, handle, indent=2, allow_nan=False)
+        handle.write("\n")
+
+
+def write_dict_csv(path: Path, row: dict[str, Any]) -> None:
+    """Write one record; nested values are represented as readable JSON."""
+    flattened = {}
+    for key, value in row.items():
+        if isinstance(value, (dict, list, tuple)):
+            flattened[key] = json.dumps(value, ensure_ascii=False)
+        else:
+            flattened[key] = value
+
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(flattened))
         writer.writeheader()
-        writer.writerow(flat)
+        writer.writerow(flattened)
 
 
-def write_rows_csv(
-    path: Path,
-    fields: list[str],
-    row: dict[str, Any],
-) -> None:
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+def write_rows_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Write multiple records with a stable union of column names."""
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+
+    fields = []
+    seen = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                fields.append(key)
+                seen.add(key)
+
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
-        writer.writerow({key: row.get(key) for key in fields})
+        for row in rows:
+            clean = {}
+            for key in fields:
+                value = row.get(key)
+                if isinstance(value, (dict, list, tuple)):
+                    value = json.dumps(value, ensure_ascii=False)
+                clean[key] = value
+            writer.writerow(clean)
 
 
-def last_number(
-    text: str,
-    patterns: list[str],
-) -> float | None:
-    """Return the last number matched by the first matching pattern."""
-    for pattern in patterns:
-        matches = list(re.finditer(pattern, text, re.I | re.M))
-        for match in reversed(matches):
-            value = finite_float(match.group(1))
-            if value is not None:
-                return value
-    return None
+def safe_name(value: str) -> str:
+    """Create a filesystem-safe directory name."""
+    result = "".join(
+        char if char.isalnum() or char in "-_." else "_"
+        for char in value
+    )
+    return result.strip("._") or "run"
 
 
-def collect_logs(run_dir: Path) -> dict[str, str]:
-    """Collect nonempty .log and .txt files recursively."""
-    if not run_dir.is_dir():
-        return {}
+def markdown_escape(value: Any) -> str:
+    text = base.display_value(value)
+    return text.replace("|", r"\|").replace("\n", " ")
 
-    paths = [
-        path
-        for path in run_dir.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() in {".log", ".txt"}
-    ]
 
-    priority = {
-        "5_2_route.log": 0,
-        "detailed_route.log": 1,
-        "openroad_log.txt": 2,
-        "flow_diagnostics.log": 3,
-    }
-
-    paths.sort(
-        key=lambda path: (
-            priority.get(path.name.lower(), 4),
-            str(path),
+def markdown_table(rows: list[tuple[str, Any]]) -> str:
+    lines = ["| Metric | Value |", "|---|---|"]
+    for label, value in rows:
+        lines.append(
+            f"| {markdown_escape(label)} | {markdown_escape(value)} |"
         )
-    )
-
-    logs = {}
-    for path in paths:
-        content = read_text(path)
-        if content.strip():
-            logs[str(path.relative_to(run_dir))] = content
-
-    return logs
+    return "\n".join(lines)
 
 
-def choose_routing_log(
-    logs: dict[str, str],
-) -> tuple[str | None, str]:
-    """Prefer a detailed-routing log; fall back to all collected logs."""
-    preferred = (
-        "5_2_route.log",
-        "detailed_route.log",
-        "openroad_log.txt",
-        "flow_diagnostics.log",
-    )
+# ---------------------------------------------------------------------
+# More reliable fanout metadata coverage
+# ---------------------------------------------------------------------
 
-    for wanted in preferred:
-        for name, content in logs.items():
-            if Path(name).name.lower() != wanted:
-                continue
-
-            if re.search(
-                r"detailed routing|detail routing|total wire length|"
-                r"number of vias|violations",
-                content,
-                re.I,
-            ):
-                return name, content
-
-    if logs:
-        return "combined_logs", "\n".join(logs.values())
-
-    return None, ""
-
-
-def find_report(
-    run_dir: Path,
-    candidates: list[str],
-) -> tuple[Path | None, str]:
-    """Find a nonempty report in the run directory or its subdirectories."""
-    for candidate in candidates:
-        paths = [run_dir / candidate]
-        paths.extend(sorted(run_dir.rglob(candidate)))
-
-        seen = set()
-        for path in paths:
-            if path in seen:
-                continue
-            seen.add(path)
-
-            if path.is_file():
-                content = read_text(path)
-                if content.strip():
-                    return path, content
-
-    return None, ""
-
-
-# ============================================================
-# Netlist extraction
-# ============================================================
-
-def classify_cell(cell_type: str) -> str:
+def fanout_metadata_coverage(netlist_path: Path, top_module: str) -> dict[str, Any]:
     """
-    Heuristic classification based on cell names.
+    Determine how many cells have complete port-direction metadata.
 
-    Validate these categories against Sky130 Liberty metadata
-    before treating them as research-grade cell classifications.
+    Fanout is not recomputed here. This function adds a coverage indicator
+    so incomplete direction metadata cannot be mistaken for complete data.
     """
-    name = str(cell_type).lower().lstrip("\\")
+    design = base.load_netlist(netlist_path)
+    modules = design["modules"]
 
-    if SEQ_RE.search(name):
-        return "sequential"
+    if top_module not in modules:
+        top_module = base.select_top(modules, top_module)
 
-    if BUF_RE.search(name):
-        return "buffer_inverter"
-
-    if COMB_RE.search(name):
-        return "combinational"
-
-    return "other"
-
-
-def load_netlist(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        raise FileNotFoundError(f"Netlist JSON not found: {path}")
-
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid JSON netlist: {exc}") from exc
-
-    if not isinstance(data, dict) or not isinstance(
-        data.get("modules"), dict
-    ):
-        raise ValueError(
-            "Expected a Yosys JSON file containing 'modules'."
-        )
-
-    return data
-
-
-def select_top(
-    modules: dict[str, Any],
-    requested_top: str,
-) -> str:
-    if requested_top in modules:
-        return requested_top
-
-    marked = []
-
-    for name, module in modules.items():
-        value = str(
-            module.get("attributes", {}).get("top", "")
-        ).strip("'")
-
-        if value.lstrip("0") == "1":
-            marked.append(name)
-
-    if len(marked) == 1:
-        print(
-            f"WARNING: using detected top module {marked[0]}",
-            file=sys.stderr,
-        )
-        return marked[0]
-
-    if len(modules) == 1:
-        return next(iter(modules))
-
-    raise ValueError(
-        f"Top '{requested_top}' not found. "
-        f"Available modules: {list(modules)}"
-    )
-
-
-def extract_netlist_features(
-    path: Path,
-    requested_top: str,
-    design_id: str,
-) -> dict[str, Any]:
-    design = load_netlist(path)
-    top = select_top(design["modules"], requested_top)
-    module = design["modules"][top]
-
-    cells = module.get("cells", {})
-    ports = module.get("ports", {})
-    netnames = module.get("netnames", {})
-
-    if not isinstance(cells, dict):
-        raise ValueError("Invalid cells object in Yosys JSON.")
-
-    cell_types = Counter(
-        str(cell.get("type", "unknown"))
-        for cell in cells.values()
-    )
-
-    class_counts = Counter()
-    for cell_type, count in cell_types.items():
-        class_counts[classify_cell(cell_type)] += count
-
-    # Calculate fanout only when actual input-port directions exist.
-    # Do not infer missing directions from signal names.
-    all_bits: set[int] = set()
-    sink_counts: Counter[int] = Counter()
-    direction_metadata_found = False
-
-    for obj in list(netnames.values()) + list(ports.values()):
-        for bit in obj.get("bits", []):
-            if isinstance(bit, int) and not isinstance(bit, bool):
-                all_bits.add(bit)
+    cells = modules[top_module].get("cells", {})
+    total_cells = len(cells)
+    cells_with_directions = 0
+    cells_with_complete_directions = 0
 
     for cell in cells.values():
         connections = cell.get("connections", {})
         directions = cell.get("port_directions", {})
 
         if isinstance(directions, dict) and directions:
-            direction_metadata_found = True
+            cells_with_directions += 1
 
-        for port_name, bits in connections.items():
-            direction = str(
-                directions.get(port_name, "")
-            ).lower()
-
-            for bit in bits:
-                if isinstance(bit, int) and not isinstance(bit, bool):
-                    all_bits.add(bit)
-
-                    if direction == "input":
-                        sink_counts[bit] += 1
-
-    fanouts = (
-        [
-            sink_counts[bit]
-            for bit in all_bits
-            if sink_counts[bit] > 0
-        ]
-        if direction_metadata_found
-        else []
-    )
-
-    net_bit_total = sum(
-        sum(
-            isinstance(bit, int) and not isinstance(bit, bool)
-            for bit in net.get("bits", [])
-        )
-        for net in netnames.values()
-    )
-
-    return {
-        "design_id": design_id,
-        "top_module": top,
-        "netlist_json": str(path),
-        "cell_count": len(cells),
-        "netname_count": len(netnames),
-        "port_count": len(ports),
-        "port_bit_count": sum(
-            len(port.get("bits", []))
-            for port in ports.values()
-        ),
-        "sequential_cell_count": class_counts["sequential"],
-        "combinational_cell_count": class_counts["combinational"],
-        "buffer_inverter_count": class_counts["buffer_inverter"],
-        "other_cell_count": class_counts["other"],
-        "unique_cell_type_count": len(cell_types),
-        "avg_bit_fanout": mean(fanouts) if fanouts else None,
-        "max_bit_fanout": max(fanouts) if fanouts else None,
-        "std_bit_fanout": (
-            pstdev(fanouts)
-            if len(fanouts) > 1
-            else 0.0 if fanouts
-            else None
-        ),
-        "fanout_direction_metadata_found": direction_metadata_found,
-        "fanout_method": (
-            "Yosys cell input-port directions"
-            if direction_metadata_found
-            else "unavailable: cell port directions missing"
-        ),
-        "total_net_bits": net_bit_total,
-        "unique_cell_types": dict(cell_types),
-        "feature_stage": "post-synthesis / pre-placement",
-        "cell_classification_method": (
-            "heuristic cell-name matching; validate against Liberty"
-        ),
-    }
-
-
-# ============================================================
-# Timing extraction
-# ============================================================
-
-def timing_patterns() -> dict[str, list[str]]:
-    return {
-        "wns_setup_ns": [
-            rf"\bworst\s+slack\s+max\s*[:=]?\s*({NUM})",
-            rf"\bwns\s+max\s*[:=]?\s*({NUM})",
-            rf"\bworst\s+slack(?:\s*\([^)]*\))?\s*[:=]\s*({NUM})",
-            rf"\bwns(?:\s*\([^)]*\))?\s*[:=]\s*({NUM})",
-        ],
-        "tns_setup_ns": [
-            rf"\btotal\s+negative\s+slack\s*[:=]\s*({NUM})",
-            rf"\btns\s+max\s*[:=]?\s*({NUM})",
-            rf"\btns(?:\s*\([^)]*\))?\s*[:=]\s*({NUM})",
-            rf"\btotal\s+negative\s+slack"
-            rf"(?:\s*\([^)]*\))?\s*[:=]\s*({NUM})",
-        ],
-        "wns_hold_ns": [
-            rf"\bworst\s+slack\s+min\s*[:=]?\s*({NUM})",
-            rf"\bwns\s+min\s*[:=]?\s*({NUM})",
-            rf"\bworst\s+slack(?:\s*\([^)]*\))?\s*[:=]\s*({NUM})",
-            rf"\bwns(?:\s*\([^)]*\))?\s*[:=]\s*({NUM})",
-        ],
-    }
-
-
-def parse_timing(text: str, metric: str) -> float | None:
-    return last_number(text, timing_patterns()[metric])
-
-
-# ============================================================
-# DEF and routing-log extraction
-# ============================================================
-
-def parse_def_routing(def_text: str) -> dict[str, Any]:
-    section = re.search(
-        r"\bNETS\s+\d+\s*;(.*?)\bEND\s+NETS\b",
-        def_text,
-        re.I | re.S,
-    )
-
-    if not section:
-        return {
-            "def_nets_section_found": False,
-            "routed_net_count": None,
-            "route_segment_count": None,
-        }
-
-    entries = re.findall(
-        r"(?ms)^[ \t]*-[ \t]+.*?;",
-        section.group(1),
-    )
-
-    routed_nets = 0
-    route_clauses = 0
-
-    for entry in entries:
-        clauses = re.findall(
-            r"\b(?:ROUTED|FIXED|COVER|NEW)\s+"
-            r"[A-Za-z0-9_.$/\[\]-]+",
-            entry,
-            re.I,
-        )
-
-        if clauses:
-            routed_nets += 1
-
-        route_clauses += len(re.findall(
-            r"\b(?:ROUTED|NEW)\s+[A-Za-z0-9_.$/\[\]-]+",
-            entry,
-            re.I,
-        ))
-
-    return {
-        "def_nets_section_found": True,
-        "routed_net_count": routed_nets,
-        "route_segment_count": route_clauses,
-    }
-
-
-def parse_route_log(text: str) -> dict[str, Any]:
-    """Parse the last matching values in the selected routing log."""
-    wirelength = last_number(text, [
-        rf"\bTotal\s+wire\s+length\s*[:=]\s*({NUM})\s*(?:um|µm)\b",
-        rf"\bTotal\s+wire\s+length\s*[:=]\s*({NUM})",
-    ])
-
-    vias = last_number(text, [
-        rf"\bTotal\s+number\s+of\s+vias\s*[:=]\s*({NUM})",
-        rf"\bNumber\s+of\s+vias\s*[:=]\s*({NUM})",
-    ])
-
-    violations = last_number(text, [
-        rf"\bNumber\s+of\s+violations\s*[:=]\s*({NUM})",
-        rf"\bTotal\s+violations\s*[:=]\s*({NUM})",
-    ])
-
-    return {
-        "wirelength_um": wirelength,
-        "via_count": int(vias) if vias is not None else None,
-        "final_detailed_route_violations": (
-            int(violations) if violations is not None else None
-        ),
-    }
-
-
-def parse_congestion(text: str) -> float | None:
-    value = last_number(text, [
-        rf"\btotal\s+(?:routing\s+)?overflow\s*[:=]\s*({NUM})",
-        rf"\bcongestion\s+overflow\s*[:=]\s*({NUM})",
-        rf"\brouting\s+overflow\s*[:=]\s*({NUM})",
-    ])
-
-    if value is not None:
-        return value
-
-    if re.search(
-        r"\b(?:no overflowing gcells|no overflowing gcell|"
-        r"zero routing overflow)\b",
-        text,
-        re.I,
-    ):
-        return 0.0
-
-    return None
-
-
-def parse_physical_log_values(text: str) -> dict[str, Any]:
-    effective_density = last_number(text, [
-        rf"\buniform density\s+to\s+({NUM})",
-        rf"\b(?:auto(?:matically)?\s+)?adjust(?:s|ed|ing)?\s+"
-        rf"uniform density\s+to\s+({NUM})",
-        rf"\beffective\s+(?:placement\s+)?density\s*[:=]\s*({NUM})",
-    ])
-
-    design_area = last_number(text, [
-        rf"\bmovable instances area\s*[:=]?\s*({NUM})",
-        rf"\bdesign area\s*[:=]\s*({NUM})",
-    ])
-
-    return {
-        "effective_place_density": effective_density,
-        "design_area_um2": design_area,
-    }
-
-
-# ============================================================
-# Physical target extraction
-# ============================================================
-
-def physical_features(run_dir: Path) -> dict[str, Any]:
-    if not run_dir.is_dir():
-        raise FileNotFoundError(
-            f"Run directory not found: {run_dir}"
-        )
-
-    def_path = run_dir / "final.def"
-    odb_path = run_dir / "final.odb"
-    def_text = read_text(def_path)
-
-    setup_path, setup_text = find_report(run_dir, [
-        "wns_setup.rpt",
-        "wns_setup_global_route.rpt",
-        "timing_setup.rpt",
-        "timing_setup_global_route.rpt",
-        "setup_timing.rpt",
-        "setup.rpt",
-    ])
-
-    tns_path, tns_text = find_report(run_dir, [
-        "tns_setup.rpt",
-        "tns_setup_global_route.rpt",
-        "timing_setup.rpt",
-        "timing_setup_global_route.rpt",
-        "setup_timing.rpt",
-        "setup.rpt",
-    ])
-
-    hold_path, hold_text = find_report(run_dir, [
-        "wns_hold.rpt",
-        "timing_hold.rpt",
-        "wns_hold_global_route.rpt",
-        "hold_timing.rpt",
-        "hold.rpt",
-    ])
-
-    congestion_path, congestion_text = find_report(run_dir, [
-        "congestion.rpt",
-        "global_route_congestion.rpt",
-        "routing_congestion.rpt",
-        "grt_congestion.rpt",
-    ])
-
-    logs = collect_logs(run_dir)
-    route_log_name, route_text = choose_routing_log(logs)
-    all_logs = "\n".join(logs.values())
-
-    setup_source = setup_text or all_logs
-    tns_source = tns_text or all_logs
-    hold_source = hold_text or all_logs
-    congestion_source = congestion_text or all_logs
-
-    wns_setup = parse_timing(setup_source, "wns_setup_ns")
-    tns_setup = parse_timing(tns_source, "tns_setup_ns")
-    wns_hold = parse_timing(hold_source, "wns_hold_ns")
-
-    route_metrics = parse_route_log(route_text)
-    congestion_overflow = parse_congestion(congestion_source)
-    physical_log_values = parse_physical_log_values(all_logs)
-
-    def_counts = (
-        parse_def_routing(def_text)
-        if def_text
-        else {
-            "def_nets_section_found": False,
-            "routed_net_count": None,
-            "route_segment_count": None,
-        }
-    )
-
-    # Search all collected logs for the success marker, including nested logs.
-    detailed_route_success = bool(re.search(
-        r"SUCCESS:\s*Detailed routing|Complete detail routing",
-        all_logs,
-        re.I,
-    ))
-
-    def_ok = (
-        def_path.is_file()
-        and def_path.stat().st_size > 0
-    )
-    odb_ok = (
-        odb_path.is_file()
-        and odb_path.stat().st_size > 0
-    )
-
-    measurements = {
-        "wns_setup_ns": (
-            "measured" if wns_setup is not None else "unavailable"
-        ),
-        "tns_setup_ns": (
-            "measured" if tns_setup is not None else "unavailable"
-        ),
-        "wns_hold_ns": (
-            "measured" if wns_hold is not None else "unavailable"
-        ),
-        "congestion_overflow": (
-            "measured"
-            if congestion_overflow is not None
-            else "unavailable"
-        ),
-        "wirelength_um": (
-            "measured"
-            if route_metrics["wirelength_um"] is not None
-            else "unavailable"
-        ),
-        "via_count": (
-            "measured"
-            if route_metrics["via_count"] is not None
-            else "unavailable"
-        ),
-        "final_detailed_route_violations": (
-            "measured"
-            if route_metrics["final_detailed_route_violations"] is not None
-            else "unavailable"
-        ),
-        "design_area_um2": (
-            "measured"
-            if physical_log_values["design_area_um2"] is not None
-            else "unavailable"
-        ),
-    }
-
-    return {
-        "final_def_available": def_path.is_file(),
-        "final_odb_available": odb_path.is_file(),
-        "final_def_nonempty": bool(def_text.strip()),
-        "artifacts_present": def_ok and odb_ok,
-        "detailed_route_success_marker_found": detailed_route_success,
-        **def_counts,
-        **route_metrics,
-        **physical_log_values,
-        "wns_setup_ns": wns_setup,
-        "tns_setup_ns": tns_setup,
-        "wns_hold_ns": wns_hold,
-        "congestion_overflow": congestion_overflow,
-        "setup_report_source": (
-            str(setup_path)
-            if setup_path
-            else "logs" if setup_source else None
-        ),
-        "tns_report_source": (
-            str(tns_path)
-            if tns_path
-            else "logs" if tns_source else None
-        ),
-        "hold_report_source": (
-            str(hold_path)
-            if hold_path
-            else "logs" if hold_source else None
-        ),
-        "congestion_report_source": (
-            str(congestion_path)
-            if congestion_path
-            else "logs" if congestion_source else None
-        ),
-        "routing_log_source": route_log_name,
-        "log_files_found": list(logs),
-        "target_measurement_status": measurements,
-        "note": (
-            "DEF route counts are approximate. Cell classifications are "
-            "heuristic and should be validated against Liberty metadata. "
-            "Fanout is unavailable if Yosys port directions are missing. "
-            "Router violations are not independent signoff DRC. Congestion "
-            "remains null unless a recognized overflow metric is found."
-        ),
-        "target_feature_stage": (
-            "post-placement/routing targets; exclude these outcomes from "
-            "predictors when predicting the same outcomes"
-        ),
-    }
-
-
-# ============================================================
-# Configuration CSV and flow-status detection
-# ============================================================
-
-
-def write_human_report(
-    outdir: Path,
-    pre: dict[str, Any],
-    post: dict[str, Any],
-    args: argparse.Namespace,
-    run_dir: Path,
-) -> None:
-    """Write a readable engineering report with assessments and actions."""
-
-    def fmt(value: Any, unit: str = "") -> str:
-        if value is None:
-            return "Unavailable"
-        if isinstance(value, bool):
-            return "Yes" if value else "No"
-        if isinstance(value, float):
-            return f"{value:,.4f}{unit}"
-        return f"{value}{unit}"
-
-    def assess(metric: str, value: Any) -> str:
-        if value is None:
-            return "Not assessed: metric unavailable"
-        if metric in ("wns_setup_ns", "wns_hold_ns"):
-            return "Non-negative slack" if value >= 0 else "Negative slack: investigate"
-        if metric == "tns_setup_ns":
-            return "Zero setup TNS" if value == 0 else (
-                "Negative TNS: investigate" if value < 0
-                else "Unexpected positive TNS: verify parser"
+        if (
+            isinstance(connections, dict)
+            and isinstance(directions, dict)
+            and connections
+            and all(
+                port in directions
+                and str(directions[port]).lower() in {"input", "output", "inout"}
+                for port in connections
             )
-        if metric == "final_detailed_route_violations":
-            return "Zero reported violations" if value == 0 else "Investigate reported violations"
-        if metric == "congestion_overflow":
-            return "Zero reported overflow" if value == 0 else "Compare with baseline and tool definition"
-        if metric == "avg_bit_fanout":
-            return "Extracted fanout" if value is not None else "Input-port direction metadata missing"
-        if metric in ("cell_count", "sequential_cell_count",
-                      "combinational_cell_count", "unique_cell_type_count"):
-            return "Informational; cell classification is heuristic"
-        if metric in ("wirelength_um", "via_count", "design_area_um2"):
-            return "Compare across runs using the same extraction method"
-        if metric == "effective_place_density":
-            return "Verify whether this is target or achieved density"
-        return "Verify metric definition and source"
+        ):
+            cells_with_complete_directions += 1
 
-    def action(metric: str, value: Any) -> str:
-        if value is None:
-            if metric == "congestion_overflow":
-                return "Inspect the OpenROAD congestion report/log and add a parser for its actual format."
-            if metric == "avg_bit_fanout":
-                return "Check whether the Yosys JSON contains cell port_directions; otherwise enrich the netlist metadata."
-            if metric == "effective_place_density":
-                return "Inspect placement logs and distinguish requested density from achieved utilization."
-            if metric in ("wns_setup_ns", "tns_setup_ns", "wns_hold_ns"):
-                return "Inspect the corresponding timing report and verify the parser matched the correct check."
-            return "Inspect the source report/log; keep this value null until it can be extracted reliably."
-
-        if metric in ("wns_setup_ns", "wns_hold_ns") and value < 0:
-            return "Inspect violating paths and check constraints before attempting timing repair."
-        if metric == "tns_setup_ns" and value < 0:
-            return "Inspect setup violations and confirm the report's TNS units and semantics."
-        if metric == "final_detailed_route_violations" and value != 0:
-            return "Review detailed-routing violations and rerun checks after any repair."
-        if metric == "congestion_overflow" and value != 0:
-            return "Identify congested regions and compare placement/routing settings."
-        if metric in ("wirelength_um", "via_count", "design_area_um2"):
-            return "Compare with other configurations; do not optimize this metric in isolation."
-        if metric == "effective_place_density":
-            return "Confirm the metric definition before using it as an ML target."
-        if metric == "avg_bit_fanout":
-            return "Check fanout distribution and investigate high-fanout nets."
-        if metric in ("cell_count", "sequential_cell_count",
-                      "combinational_cell_count", "unique_cell_type_count"):
-            return "Validate cell categories against Liberty metadata before research use."
-        return "Retain the result and validate against the source report."
-
-    # Match the status logic used by write_configuration_csv().
-    def flow_status() -> tuple[str, str]:
-        def_ok = bool(
-            post.get("final_def_available")
-            and post.get("final_def_nonempty")
-        )
-        odb_ok = bool(post.get("final_odb_available"))
-        route_success = bool(post.get("detailed_route_success_marker_found"))
-
-        if route_success and def_ok and odb_ok:
-            return "detailed_routing_completed", "detailed_routing"
-        if def_ok and odb_ok:
-            return "artifacts_present", "unknown"
-        if def_ok or odb_ok:
-            return "partial_artifacts", "unknown"
-        if post.get("log_files_found"):
-            return "flow_incomplete_or_unverified", "unknown"
-        return "no_artifacts_or_logs", "unknown"
-
-    metrics = [
-        ("cell_count", "Synthesis cell count", pre.get("cell_count"), "", "Mapped cell instances in the synthesized netlist."),
-        ("sequential_cell_count", "Sequential cells", pre.get("sequential_cell_count"), "", "Cells classified as sequential using name patterns."),
-        ("combinational_cell_count", "Combinational cells", pre.get("combinational_cell_count"), "", "Cells classified as combinational using name patterns."),
-        ("unique_cell_type_count", "Unique cell types", pre.get("unique_cell_type_count"), "", "Number of distinct mapped cell types."),
-        ("avg_bit_fanout", "Average bit fanout", pre.get("avg_bit_fanout"), "", "Average sink count per included net bit."),
-        ("effective_place_density", "Effective placement density", post.get("effective_place_density"), "", "Density value extracted from logs; may be a requested setting."),
-        ("design_area_um2", "Reported design area", post.get("design_area_um2"), " µm²", "Area reported by the matched log pattern; verify its exact definition."),
-        ("wirelength_um", "Routed wirelength", post.get("wirelength_um"), " µm", "Wirelength extracted from routing logs."),
-        ("via_count", "Via count", post.get("via_count"), "", "Via count extracted from routing logs."),
-        ("wns_setup_ns", "Setup WNS", post.get("wns_setup_ns"), " ns", "Worst setup slack extracted from a report or fallback logs."),
-        ("tns_setup_ns", "Setup TNS", post.get("tns_setup_ns"), " ns", "Total negative setup slack extracted from a report or fallback logs."),
-        ("wns_hold_ns", "Hold WNS", post.get("wns_hold_ns"), " ns", "Worst hold slack extracted from a report or fallback logs."),
-        ("congestion_overflow", "Congestion overflow", post.get("congestion_overflow"), "", "Overflow metric, if recognized in the report or logs."),
-        ("final_detailed_route_violations", "Detailed-route violations", post.get("final_detailed_route_violations"), "", "Extracted router violations; not independent signoff DRC."),
-    ]
-
-    detected_status, last_stage = flow_status()
-    run_id = args.run_id or run_dir.name
-
-    lines = [
-        "# FIR Physical Design Run Report",
-        "",
-        f"- **Run ID:** `{run_id}`",
-        f"- **Design ID:** `{args.design_id}`",
-        f"- **Top module:** `{pre.get('top_module')}`",
-        f"- **Run directory:** `{run_dir}`",
-        f"- **Detected flow status:** `{detected_status}`",
-        f"- **Last completed stage:** `{last_stage}`",
-        "",
-        "## Configuration",
-        "",
-        "| Parameter | Value |",
-        "|---|---:|",
-        f"| Taps | {fmt(args.taps)} |",
-        f"| Data width | {fmt(args.data_width, ' bits')} |",
-        f"| Coefficient width | {fmt(args.coeff_width, ' bits')} |",
-        f"| Accumulator width | {fmt(args.acc_width, ' bits')} |",
-        f"| Target utilization | {fmt(args.utilization, '%')} |",
-        f"| Requested placement density | {fmt(args.place_density)} |",
-        f"| Clock period | {fmt(args.clock_period, ' ns')} |",
-        "",
-        "## Metrics, meaning, assessment and recommended action",
-        "",
-        "| Tag | Value | Meaning | Assessment | Recommended action |",
-        "|---|---:|---|---|---|",
-    ]
-
-    for key, label, value, unit, meaning in metrics:
-        lines.append(
-            f"| `{key}` ({label}) | {fmt(value, unit)} | {meaning} | "
-            f"{assess(key, value)} | {action(key, value)} |"
-        )
-
-    missing = [key for key, _, value, _, _ in metrics if value is None]
-
-    lines.extend(["", "## Artifact checks", ""])
-    lines.append(f"- Final DEF available: {fmt(post.get('final_def_available'))}")
-    lines.append(f"- Final DEF nonempty: {fmt(post.get('final_def_nonempty'))}")
-    lines.append(f"- Final ODB available: {fmt(post.get('final_odb_available'))}")
-    lines.append(
-        "- Detailed-route success marker: "
-        f"{fmt(post.get('detailed_route_success_marker_found'))}"
+    coverage = (
+        cells_with_complete_directions / total_cells
+        if total_cells else None
     )
 
-    lines.extend(["", "## Required follow-up", ""])
-    if missing:
-        lines.append("Metrics not extracted:")
-        lines.extend(f"- `{key}`" for key in missing)
+    return {
+        "fanout_total_cells": total_cells,
+        "fanout_cells_with_any_directions": cells_with_directions,
+        "fanout_cells_with_complete_directions": cells_with_complete_directions,
+        "fanout_direction_coverage_fraction": coverage,
+        "fanout_direction_coverage_percent": (
+            coverage * 100 if coverage is not None else None
+        ),
+        "fanout_metadata_complete_for_all_cells": (
+            total_cells > 0
+            and cells_with_complete_directions == total_cells
+        ),
+    }
+
+
+# ---------------------------------------------------------------------
+# Per-run extraction
+# ---------------------------------------------------------------------
+
+def extract_one(
+    row: dict[str, str],
+    output_root: Path,
+    manifest_dir: Path,
+) -> dict[str, Any]:
+    """
+    Extract one design using the existing extraction functions.
+    Relative paths in the manifest are resolved relative to the manifest.
+    """
+    def resolve_path(value: str) -> Path:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = manifest_dir / path
+        return path.resolve()
+
+    run_dir = resolve_path(row["run_dir"])
+    netlist_path = resolve_path(row["netlist_json"])
+
+    run_id = row.get("run_id") or run_dir.name
+    design_id = row.get("design_id") or run_id
+    requested_top = row.get("top") or "fir_filter"
+
+    run_output = output_root / safe_name(run_id)
+    run_output.mkdir(parents=True, exist_ok=True)
+
+    # Extract netlist and physical metrics using the original extractor.
+    pre = base.extract_netlist_features(
+        netlist_path, requested_top, design_id
+    )
+
+    # Use the actual selected top module, including fallback selection.
+    actual_top = pre.get("top_module", requested_top)
+
+    pre["run_id"] = run_id
+    pre["design_id"] = design_id
+    pre["utilization_constraint_percent"] = optional_float(
+        row, "utilization"
+    )
+    pre["clock_period_ns"] = optional_float(row, "clock_period")
+
+    # Configuration values can vary by run.
+    pre["taps"] = optional_int(row, "taps")
+    pre["data_width"] = optional_int(row, "data_width")
+    pre["coeff_width"] = optional_int(row, "coeff_width")
+    pre["acc_width"] = optional_int(row, "acc_width")
+    pre["place_density"] = optional_float(row, "place_density")
+
+    # Correctly record actual top module for report/workbook configuration.
+    post = base.physical_features(run_dir)
+    coverage = fanout_metadata_coverage(netlist_path, actual_top)
+    pre.update(coverage)
+
+    # Expose fanout limitations explicitly.
+    if not pre["fanout_metadata_complete_for_all_cells"]:
+        pre["fanout_quality_warning"] = (
+            "Some cells lack complete port-direction metadata. "
+            "Fanout statistics may be incomplete; do not treat them "
+            "as fully validated measurements."
+        )
     else:
-        lines.append("All listed metrics have values. Validate their definitions and units before drawing research conclusions.")
+        pre["fanout_quality_warning"] = (
+            "All cells have complete port-direction metadata."
+        )
 
-    lines.extend([
-        "",
-        "## Extraction caveats",
-        "",
-        f"- Fanout method: {pre.get('fanout_method', 'unknown')}.",
-        f"- Cell classification: {pre.get('cell_classification_method', 'unknown')}.",
-        f"- Routing note: {post.get('note', 'No note provided')}",
-        "- DEF-derived route counts may be approximate.",
-        "- Router-reported zero violations does not establish independent signoff DRC closure.",
-        "- A single run cannot establish optimization quality; compare configurations under consistent constraints.",
-        "- Exclude post-placement/routing targets from predictor features when predicting those same outcomes.",
-        "",
-    ])
+    # Keep output values finite and JSON-safe.
+    for mapping in (pre, post):
+        for key, value in list(mapping.items()):
+            if isinstance(value, float) and not math.isfinite(value):
+                mapping[key] = None
 
-    (outdir / "run_report.md").write_text(
-        "\n".join(lines), encoding="utf-8"
-    )
+    combined = {**pre, **post}
 
-
-def write_configuration_csv(
-    outdir: Path,
-    run_dir: Path,
-    args: argparse.Namespace,
-    post: dict[str, Any],
-) -> None:
-    """Write the FIR configuration and automatically detected flow status."""
-
-    def_ok = bool(
-        post.get("final_def_available")
-        and post.get("final_def_nonempty")
-    )
+    # Build a compact configuration row for the design.
+    def_ok = bool(post.get("final_def_available") and post.get("final_def_nonempty"))
     odb_ok = bool(post.get("final_odb_available"))
-    route_success = bool(
-        post.get("detailed_route_success_marker_found")
-    )
+    route_success = bool(post.get("detailed_route_success_marker_found"))
 
     if route_success and def_ok and odb_ok:
         flow_status = "detailed_routing_completed"
@@ -926,205 +327,507 @@ def write_configuration_csv(
         flow_status = "no_artifacts_or_logs"
         last_stage = "unknown"
 
-    fields = [
-        "run_id",
-        "taps",
-        "data_width",
-        "coeff_width",
-        "acc_width",
-        "utilization",
-        "place_density",
-        "clk_period_ns",
-        "flow_status",
-        "last_completed_stage",
-    ]
-
-    row = {
-        "run_id": args.run_id or run_dir.name,
-        "taps": args.taps,
-        "data_width": args.data_width,
-        "coeff_width": args.coeff_width,
-        "acc_width": args.acc_width,
-        "utilization": args.utilization,
-        "place_density": args.place_density,
-        "clk_period_ns": args.clock_period,
+    config = {
+        "run_id": run_id,
+        "design_id": design_id,
+        "top_module": actual_top,
+        "netlist_json": str(netlist_path),
+        "run_dir": str(run_dir),
+        "taps": pre["taps"],
+        "data_width": pre["data_width"],
+        "coeff_width": pre["coeff_width"],
+        "acc_width": pre["acc_width"],
+        "utilization": pre["utilization_constraint_percent"],
+        "place_density": pre["place_density"],
+        "clk_period_ns": pre["clock_period_ns"],
         "flow_status": flow_status,
         "last_completed_stage": last_stage,
     }
 
-    write_rows_csv(outdir / "fir_features.csv", fields, row)
+    # Per-run machine-readable outputs.
+    write_json(run_output / "preplacement_features.json", pre)
+    write_dict_csv(run_output / "preplacement_features.csv", pre)
+
+    write_json(run_output / "physical_targets.json", post)
+    write_dict_csv(run_output / "physical_targets.csv", post)
+
+    write_json(run_output / "features.json", combined)
+    write_dict_csv(run_output / "features.csv", combined)
+
+    write_json(run_output / "extraction_status.json", {
+        "run_id": run_id,
+        "design_id": design_id,
+        "top_module": actual_top,
+        "run_dir": str(run_dir),
+        "netlist_json": str(netlist_path),
+        "output_dir": str(run_output),
+        "flow_status": flow_status,
+        "fanout_direction_coverage_percent": coverage[
+            "fanout_direction_coverage_percent"
+        ],
+        "fanout_metadata_complete_for_all_cells": coverage[
+            "fanout_metadata_complete_for_all_cells"
+        ],
+        "target_measurement_status": post.get(
+            "target_measurement_status", {}
+        ),
+    })
+
+    # Markdown report: actual selected module, not just requested top.
+    config_rows = [
+        ("Run ID", run_id),
+        ("Design ID", design_id),
+        ("Top module selected", actual_top),
+        ("Netlist JSON", str(netlist_path)),
+        ("Run directory", str(run_dir)),
+        ("FIR taps", pre["taps"]),
+        ("Data width (bits)", pre["data_width"]),
+        ("Coefficient width (bits)", pre["coeff_width"]),
+        ("Accumulator width (bits)", pre["acc_width"]),
+        ("Utilization constraint (%)", pre["utilization_constraint_percent"]),
+        ("Placement density", pre["place_density"]),
+        ("Clock period (ns)", pre["clock_period_ns"]),
+        ("Detected flow status", flow_status),
+    ]
+
+    synthesis_keys = [
+        "cell_count", "netname_count", "port_count", "port_bit_count",
+        "sequential_cell_count", "combinational_cell_count",
+        "buffer_inverter_count", "other_cell_count", "unique_cell_type_count",
+        "avg_bit_fanout", "max_bit_fanout", "std_bit_fanout",
+        "fanout_direction_coverage_percent",
+        "fanout_metadata_complete_for_all_cells",
+        "fanout_quality_warning", "total_net_bits",
+        "cell_classification_method",
+    ]
+
+    target_keys = [
+        "final_def_available", "final_odb_available", "final_def_nonempty",
+        "artifacts_present", "detailed_route_success_marker_found",
+        "routed_net_count", "route_segment_count", "wirelength_um",
+        "via_count", "final_detailed_route_violations",
+        "effective_place_density", "design_area_um2",
+        "wns_setup_ns", "tns_setup_ns", "wns_hold_ns",
+        "congestion_overflow",
+    ]
+
+    source_keys = [
+        "setup_report_source", "tns_report_source", "hold_report_source",
+        "congestion_report_source", "routing_log_source",
+        "target_feature_stage", "note",
+    ]
+
+    lines = [
+        "# FIR Physical-Design Feature Report",
+        "",
+        f"**Run:** `{run_id}`",
+        "",
+        "## 1. Configuration",
+        "",
+        markdown_table(config_rows),
+        "",
+        "## 2. Synthesis and netlist features",
+        "",
+        markdown_table([
+            (base.DISPLAY_NAMES.get(k, k.replace("_", " ").title()), pre.get(k))
+            for k in synthesis_keys
+        ]),
+        "",
+        "## 3. Physical-design results",
+        "",
+        markdown_table([
+            (base.DISPLAY_NAMES.get(k, k.replace("_", " ").title()), post.get(k))
+            for k in target_keys
+        ]),
+        "",
+        "## 4. Measurement sources and notes",
+        "",
+        markdown_table([
+            (base.DISPLAY_NAMES.get(k, k.replace("_", " ").title()), post.get(k))
+            for k in source_keys
+        ]),
+        "",
+        "## 5. Interpretation notes",
+        "",
+        "- `N/A (not extracted)` means unavailable, not zero.",
+        "- DEF route counts are approximate.",
+        "- Cell-type classification is heuristic and should be validated against Liberty metadata.",
+        "- Fanout metrics require complete and correct Yosys port-direction metadata.",
+        "- Timing and routing metrics are targets/outcomes; exclude a target from predictors when predicting that same target to prevent data leakage.",
+        "- Reported detailed-route violations are not a substitute for independent signoff DRC.",
+        "- Timing extraction should be validated against the report format used by your flow.",
+        "",
+        "## 6. Files written for this run",
+        "",
+        "- `preplacement_features.csv` and `.json`",
+        "- `physical_targets.csv` and `.json`",
+        "- `features.csv` and `.json`",
+        "- `extraction_status.json`",
+        "- `run_report.md`",
+        "",
+    ]
+
+    (run_output / "run_report.md").write_text(
+        "\n".join(lines), encoding="utf-8"
+    )
+
+    # Return flat records for consolidated CSV/XLSX.
+    return {
+        "config": config,
+        "pre": pre,
+        "post": post,
+        "combined": combined,
+        "output_dir": str(run_output),
+    }
 
 
-# ============================================================
+# ---------------------------------------------------------------------
+# Consolidated Excel workbook
+# ---------------------------------------------------------------------
+
+def write_workbook(
+    output_root: Path,
+    results: list[dict[str, Any]],
+) -> bool:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print(
+            "WARNING: Excel workbook skipped. Install openpyxl with "
+            "'python -m pip install openpyxl'.",
+            file=sys.stderr,
+        )
+        return False
+
+    wb = Workbook()
+    ws_config = wb.active
+    ws_config.title = "Configuration"
+    ws_synth = wb.create_sheet("Synthesis Features")
+    ws_targets = wb.create_sheet("Physical Targets")
+    ws_combined = wb.create_sheet("Combined Data")
+    ws_dictionary = wb.create_sheet("Metric Dictionary")
+
+    def write_table(ws: Any, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            ws.append(["No data"])
+            return
+
+        columns = []
+        seen = set()
+        for row in rows:
+            for key in row:
+                if key not in seen:
+                    columns.append(key)
+                    seen.add(key)
+
+        ws.append(columns)
+        for row in rows:
+            values = []
+            for key in columns:
+                value = row.get(key)
+                if isinstance(value, (dict, list, tuple)):
+                    value = json.dumps(value, ensure_ascii=False)
+                values.append(value)
+            ws.append(values)
+
+    write_table(ws_config, [r["config"] for r in results])
+    write_table(ws_synth, [r["pre"] for r in results])
+    write_table(ws_targets, [r["post"] for r in results])
+
+    # Critical fix: one row per design, one column per feature/target.
+    write_table(ws_combined, [r["combined"] for r in results])
+
+    dictionary_rows = [
+        {
+            "field": "run_id",
+            "type": "identifier",
+            "unit": "none",
+            "stage": "configuration",
+            "description": "Unique identifier for this run.",
+            "ml_note": "Use for grouping/tracking, not normally as a numeric predictor.",
+        },
+        {
+            "field": "cell_count",
+            "type": "feature",
+            "unit": "cells",
+            "stage": "post-synthesis / pre-placement",
+            "description": "Number of cells in the selected Yosys top module.",
+            "ml_note": "Potential predictor.",
+        },
+        {
+            "field": "avg_bit_fanout",
+            "type": "feature; validate coverage",
+            "unit": "loads per bit",
+            "stage": "post-synthesis / pre-placement",
+            "description": "Mean sink count over bits counted by the extractor.",
+            "ml_note": "Use cautiously when port-direction coverage is incomplete.",
+        },
+        {
+            "field": "wns_setup_ns",
+            "type": "target",
+            "unit": "ns",
+            "stage": "timing analysis",
+            "description": "Worst setup slack extracted from the available timing source.",
+            "ml_note": "Exclude from predictors when predicting setup WNS.",
+        },
+        {
+            "field": "tns_setup_ns",
+            "type": "target",
+            "unit": "ns",
+            "stage": "timing analysis",
+            "description": "Total setup negative slack extracted from the available source.",
+            "ml_note": "Exclude from predictors when predicting setup TNS.",
+        },
+        {
+            "field": "wns_hold_ns",
+            "type": "target",
+            "unit": "ns",
+            "stage": "timing analysis",
+            "description": "Worst hold slack extracted from the available timing source.",
+            "ml_note": "Exclude from predictors when predicting hold WNS.",
+        },
+        {
+            "field": "wirelength_um",
+            "type": "target",
+            "unit": "µm",
+            "stage": "routing",
+            "description": "Wirelength reported by the selected routing log.",
+            "ml_note": "Exclude from predictors when predicting wirelength.",
+        },
+        {
+            "field": "via_count",
+            "type": "target",
+            "unit": "vias",
+            "stage": "routing",
+            "description": "Via count extracted from the selected routing log.",
+            "ml_note": "Exclude from predictors when predicting via count.",
+        },
+        {
+            "field": "congestion_overflow",
+            "type": "target",
+            "unit": "flow-defined",
+            "stage": "global routing / congestion report",
+            "description": "Overflow only when a recognized metric is available.",
+            "ml_note": "Missing means not extracted, not zero.",
+        },
+        {
+            "field": "design_area_um2",
+            "type": "metric; verify report definition",
+            "unit": "µm²",
+            "stage": "physical-design log",
+            "description": "Area parsed from recognized log text; confirm exact meaning.",
+            "ml_note": "Use only if its measurement stage is appropriate for the task.",
+        },
+    ]
+    write_table(ws_dictionary, dictionary_rows)
+
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    thin = Side(style="thin", color="D9E2F3")
+
+    for ws in wb.worksheets:
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        ws.sheet_view.showGridLines = False
+
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.border = Border(bottom=thin)
+
+        ws.row_dimensions[1].height = 30
+
+        for col_cells in ws.columns:
+            letter = get_column_letter(col_cells[0].column)
+            max_length = max(
+                (len(str(cell.value)) if cell.value is not None else 0)
+                for cell in col_cells
+            )
+            ws.column_dimensions[letter].width = min(
+                max(max_length + 2, 14), 42
+            )
+
+    wb.save(output_root / "fir_multi_run_dataset.xlsx")
+    return True
+
+
+# ---------------------------------------------------------------------
 # Main
-# ============================================================
+# ---------------------------------------------------------------------
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description=(
-            "Extract FIR netlist features and OpenROAD physical targets."
-        )
-    )
-
-    parser.add_argument(
-        "--netlist-json",
-        default="fir_project/synth/fir_filter_netlist.json",
+        description="Build a multi-run FIR feature dataset from existing runs."
     )
     parser.add_argument(
-        "--run-dir",
-        default="fir_project/runs/fir_8tap_w8_util40_clk10",
+        "--manifest",
+        default="fir_runs_manifest.csv",
+        help="CSV manifest containing one row per design/run.",
     )
-    parser.add_argument("--outdir", default=None)
-    parser.add_argument("--top", default="fir_filter")
     parser.add_argument(
-        "--design-id",
-        default="fir_filter_8tap",
+        "--outdir",
+        default="fir_multi_run_output",
+        help="Directory for per-run reports and consolidated datasets.",
     )
-    parser.add_argument("--run-id", default=None)
-
-    parser.add_argument("--taps", type=int, default=None)
-    parser.add_argument("--data-width", type=int, default=None)
-    parser.add_argument("--coeff-width", type=int, default=None)
-    parser.add_argument("--acc-width", type=int, default=None)
-    parser.add_argument("--utilization", type=float, default=None)
-    parser.add_argument("--place-density", type=float, default=None)
-    parser.add_argument("--clock-period", type=float, default=None)
-    parser.add_argument(
-        "--flow-status",
-        default=None,
-        help="Deprecated; detected status is used instead",
-    )
-
     args = parser.parse_args()
 
-    run_dir = Path(args.run_dir)
-    outdir = Path(args.outdir) if args.outdir else run_dir
-    netlist_path = Path(args.netlist_json)
-
-    if args.utilization is not None and not (
-        0 < args.utilization <= 100
-    ):
-        parser.error("--utilization must be > 0 and <= 100.")
-
-    if args.place_density is not None and not (
-        0 < args.place_density <= 1
-    ):
-        parser.error("--place-density must be > 0 and <= 1.")
-
-    if args.clock_period is not None and args.clock_period <= 0:
-        parser.error("--clock-period must be positive.")
-
-    for name in ("taps", "data_width", "coeff_width", "acc_width"):
-        value = getattr(args, name)
-        if value is not None and value <= 0:
-            parser.error(
-                f"--{name.replace('_', '-')} must be positive."
-            )
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    output_root = Path(args.outdir).expanduser().resolve()
 
     try:
-        outdir.mkdir(parents=True, exist_ok=True)
+        rows = read_manifest(manifest_path)
+        output_root.mkdir(parents=True, exist_ok=True)
 
-        pre = extract_netlist_features(
-            netlist_path,
-            args.top,
-            args.design_id,
+        results = []
+        failures = []
+
+        for index, row in enumerate(rows, start=1):
+            run_id = row.get("run_id") or Path(row["run_dir"]).name
+            print(f"[{index}/{len(rows)}] Extracting {run_id} ...")
+
+            try:
+                result = extract_one(
+                    row=row,
+                    output_root=output_root / "runs",
+                    manifest_dir=manifest_path.parent,
+                )
+                results.append(result)
+                print(f"    OK: {result['output_dir']}")
+            except Exception as exc:
+                failures.append({
+                    "run_id": run_id,
+                    "run_dir": row.get("run_dir"),
+                    "error": str(exc),
+                })
+                print(f"    ERROR: {run_id}: {exc}", file=sys.stderr)
+
+        if not results:
+            write_json(output_root / "failures.json", {"failures": failures})
+            print("No runs were extracted successfully.", file=sys.stderr)
+            return 1
+
+        # Consolidated ML-friendly CSVs: one row per design.
+        write_rows_csv(
+            output_root / "combined_features_targets.csv",
+            [r["combined"] for r in results],
         )
-        pre["utilization_constraint_percent"] = args.utilization
-        pre["clock_period_ns"] = args.clock_period
-
-        post = physical_features(run_dir)
-
-        write_json(outdir / "preplacement_features.json", pre)
-        write_csv(outdir / "preplacement_features.csv", pre)
-
-        write_json(outdir / "physical_targets.json", post)
-        write_csv(outdir / "physical_targets.csv", post)
-
-        combined = {**pre, **post}
-        write_json(outdir / "features.json", combined)
-        write_csv(outdir / "features.csv", combined)
-
-        write_human_report(
-            outdir,
-            pre,
-            post,
-            args,
-            run_dir,
+        write_rows_csv(
+            output_root / "combined_configurations.csv",
+            [r["config"] for r in results],
         )
-        write_configuration_csv(
-            outdir,
-            run_dir,
-            args,
-            post,
+        write_rows_csv(
+            output_root / "combined_synthesis_features.csv",
+            [r["pre"] for r in results],
+        )
+        write_rows_csv(
+            output_root / "combined_physical_targets.csv",
+            [r["post"] for r in results],
         )
 
-        status = {
-            "design_id": args.design_id,
-            "run_id": args.run_id or run_dir.name,
-            "netlist_json": str(netlist_path),
-            "run_dir": str(run_dir),
-            "output_dir": str(outdir),
-            "fanout_direction_metadata_found": (
-                pre["fanout_direction_metadata_found"]
-            ),
-            "final_def_available": post["final_def_available"],
-            "final_odb_available": post["final_odb_available"],
-            "artifacts_present": post["artifacts_present"],
-            "detailed_route_success_marker_found": (
-                post["detailed_route_success_marker_found"]
-            ),
-            "target_measurement_status": (
-                post["target_measurement_status"]
-            ),
-        }
+        xlsx_created = write_workbook(output_root, results)
 
-        write_json(outdir / "extraction_status.json", status)
+        write_json(output_root / "multi_run_status.json", {
+            "manifest": str(manifest_path),
+            "output_dir": str(output_root),
+            "runs_requested": len(rows),
+            "runs_succeeded": len(results),
+            "runs_failed": len(failures),
+            "excel_workbook_created": xlsx_created,
+            "failures": failures,
+            "successful_run_output_directories": [
+                r["output_dir"] for r in results
+            ],
+            "important_notes": [
+                "Existing run artifacts are read; OpenROAD is not rerun.",
+                "N/A/null values mean unavailable, not zero.",
+                "Validate timing extraction against the actual report format.",
+                "Avoid target leakage when preparing ML predictors.",
+            ],
+        })
 
-    except (OSError, ValueError) as exc:
+        # Consolidated GitHub-friendly report.
+        report_lines = [
+            "# FIR Multi-Run Feature Extraction",
+            "",
+            f"- Runs requested: {len(rows)}",
+            f"- Runs extracted successfully: {len(results)}",
+            f"- Runs failed: {len(failures)}",
+            "",
+            "## Run summary",
+            "",
+            "| Run ID | Design ID | Top module | Flow status | Output directory |",
+            "|---|---|---|---|---|",
+        ]
+
+        for result in results:
+            cfg = result["config"]
+            report_lines.append(
+                f"| {markdown_escape(cfg.get('run_id'))} "
+                f"| {markdown_escape(cfg.get('design_id'))} "
+                f"| {markdown_escape(cfg.get('top_module'))} "
+                f"| {markdown_escape(cfg.get('flow_status'))} "
+                f"| {markdown_escape(result.get('output_dir'))} |"
+            )
+
+        report_lines.extend([
+            "",
+            "## Consolidated files",
+            "",
+            "- `combined_features_targets.csv`: one row per run, all extracted fields.",
+            "- `combined_configurations.csv`: one row per run, configuration and flow status.",
+            "- `combined_synthesis_features.csv`: one row per run, synthesis/netlist features.",
+            "- `combined_physical_targets.csv`: one row per run, physical-design outcomes.",
+            "- `fir_multi_run_dataset.xlsx`: formatted workbook with a row-wise Combined Data sheet, if openpyxl is installed.",
+            "- `multi_run_status.json`: extraction status and failures.",
+            "",
+            "## Interpretation cautions",
+            "",
+            "- Missing metrics are not zero.",
+            "- Routed-net and route-segment counts are approximate.",
+            "- Timing and routing targets must not leak into predictors for the same target.",
+            "- Validate timing extraction against the exact OpenROAD report format.",
+            "",
+        ])
+        (output_root / "multi_run_report.md").write_text(
+            "\n".join(report_lines), encoding="utf-8"
+        )
+
+        print("\n===== Multi-run extraction summary =====")
+        print(f"Runs requested : {len(rows)}")
+        print(f"Runs succeeded : {len(results)}")
+        print(f"Runs failed    : {len(failures)}")
+        print(f"Output folder  : {output_root}")
+        print("\nGenerated consolidated files:")
+        for filename in (
+            "combined_features_targets.csv",
+            "combined_configurations.csv",
+            "combined_synthesis_features.csv",
+            "combined_physical_targets.csv",
+            "fir_multi_run_dataset.xlsx",
+            "multi_run_report.md",
+            "multi_run_status.json",
+        ):
+            path = output_root / filename
+            if path.exists():
+                print(f"  - {path}")
+
+        if failures:
+            print("\nFailed runs:")
+            for failure in failures:
+                print(f"  - {failure['run_id']}: {failure['error']}")
+
+        return 0 if not failures else 2
+
+    except (OSError, ValueError, csv.Error) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-
-    print("\n===== FIR Feature Extraction =====")
-    print(f"Run directory: {run_dir}")
-    print(f"Output directory: {outdir}")
-    print(f"Cell count: {pre['cell_count']}")
-    print(f"Sequential: {pre['sequential_cell_count']}")
-    print(f"Combinational: {pre['combinational_cell_count']}")
-    print(f"Fanout method: {pre['fanout_method']}")
-    print(f"Final DEF: {post['final_def_available']}")
-    print(f"Final ODB: {post['final_odb_available']}")
-    print(
-        "Routing success marker: "
-        f"{post['detailed_route_success_marker_found']}"
-    )
-
-    print("\n===== Physical Targets =====")
-    for key in (
-        "wns_setup_ns",
-        "tns_setup_ns",
-        "wns_hold_ns",
-        "congestion_overflow",
-        "wirelength_um",
-        "via_count",
-        "final_detailed_route_violations",
-        "design_area_um2",
-        "effective_place_density",
-    ):
-        print(f"{key}: {post.get(key)}")
-
-    print("\n===== Target Status =====")
-    for key, value in post["target_measurement_status"].items():
-        print(f"{key}: {value}")
-
-    print(
-        "\nGenerated: preplacement_features.csv, physical_targets.csv,"
-    )
-    print(
-        "           features.csv, fir_features.csv, "
-        "extraction_status.json, run_report.md"
-    )
-    print("\nExtraction finished.")
-    return 0
 
 
 if __name__ == "__main__":
