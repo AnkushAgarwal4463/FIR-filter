@@ -781,6 +781,144 @@ def write_configuration_csv(
     print(f"Final ODB nonempty: {odb_ok}")
 
 
+def write_human_report(
+    outdir: Path,
+    pre: dict[str, Any],
+    post: dict[str, Any],
+    args: argparse.Namespace,
+    run_dir: Path,
+) -> None:
+    """Write an engineering summary of extracted FIR results."""
+
+    def fmt(value: Any, unit: str = "") -> str:
+        if value is None:
+            return "Unavailable (not extracted)"
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+        if isinstance(value, float):
+            return f"{value:,.4f}{unit}"
+        return f"{value}{unit}"
+
+    def assess(metric: str, value: Any) -> str:
+        if value is None:
+            return "Cannot assess: metric unavailable"
+
+        if metric in ("wns_setup_ns", "wns_hold_ns"):
+            return "PASS: non-negative slack" if value >= 0 else "FAIL: negative slack"
+
+        if metric == "tns_setup_ns":
+            return "PASS: zero TNS" if value == 0 else (
+                "Investigate negative setup slack"
+                if value < 0 else
+                "Check report semantics; TNS is unexpectedly positive"
+            )
+
+        if metric == "final_detailed_route_violations":
+            return "No reported violations" if value == 0 else "Investigate routing violations"
+
+        if metric == "congestion_overflow":
+            return "No reported overflow" if value == 0 else "Compare against baseline and tool definition"
+
+        if metric in ("wirelength_um", "via_count", "design_area_um2"):
+            return "Compare with other configurations; lower is not always better"
+
+        return "Informational; verify against flow configuration"
+
+    metrics = [
+        ("cell_count", "Synthesis cell count", pre.get("cell_count"), "", "Number of mapped cell instances in the synthesized netlist."),
+        ("sequential_cell_count", "Sequential cells", pre.get("sequential_cell_count"), "", "Heuristic classification; validate against Liberty."),
+        ("combinational_cell_count", "Combinational cells", pre.get("combinational_cell_count"), "", "Heuristic classification; validate against Liberty."),
+        ("unique_cell_type_count", "Unique cell types", pre.get("unique_cell_type_count"), "", "Number of distinct cell types."),
+        ("avg_bit_fanout", "Average bit fanout", pre.get("avg_bit_fanout"), "", "Unavailable when cell-port directions are missing."),
+        ("effective_place_density", "Effective placement density", post.get("effective_place_density"), "", "Extracted density; not necessarily the achieved final utilization."),
+        ("design_area_um2", "Reported design area", post.get("design_area_um2"), " µm²", "Confirm whether this is cell area or another area definition."),
+        ("wirelength_um", "Reported routed wirelength", post.get("wirelength_um"), " µm", "DEF/log-derived value; extraction method may be approximate."),
+        ("via_count", "Reported via count", post.get("via_count"), "", "Compare across configurations using the same extraction method."),
+        ("wns_setup_ns", "Setup worst negative slack (WNS)", post.get("wns_setup_ns"), " ns", "Positive slack is encouraging if the timing report and constraints are valid."),
+        ("tns_setup_ns", "Setup total negative slack (TNS)", post.get("tns_setup_ns"), " ns", "Zero usually indicates no negative setup slack in the reported checks."),
+        ("wns_hold_ns", "Hold worst negative slack (WNS)", post.get("wns_hold_ns"), " ns", "Non-negative slack is encouraging if all required hold checks are covered."),
+        ("congestion_overflow", "Routing congestion overflow", post.get("congestion_overflow"), "", "Do not infer low congestion when this metric is unavailable."),
+        ("final_detailed_route_violations", "Extracted detailed-route violations", post.get("final_detailed_route_violations"), "", "Not equivalent to independent signoff DRC."),
+    ]
+
+    lines = [
+        "# FIR Physical Design Run Report",
+        "",
+        f"- **Run ID:** `{args.run_id or run_dir.name}`",
+        f"- **Design ID:** `{args.design_id}`",
+        f"- **Top module:** `{pre.get('top_module')}`",
+        f"- **Run directory:** `{run_dir}`",
+        f"- **Flow status:** `{('detailed routing completion marker found' if post.get('detailed_route_success_marker_found') else 'completion not independently verified')}`",
+        "",
+        "## Configuration",
+        "",
+        "| Parameter | Value |",
+        "|---|---:|",
+        f"| Taps | {fmt(args.taps)} |",
+        f"| Data width | {fmt(args.data_width, ' bits')} |",
+        f"| Coefficient width | {fmt(args.coeff_width, ' bits')} |",
+        f"| Accumulator width | {fmt(args.acc_width, ' bits')} |",
+        f"| Target utilization | {fmt(args.utilization, '%')} |",
+        f"| Requested placement density | {fmt(args.place_density)} |",
+        f"| Clock period | {fmt(args.clock_period, ' ns')} |",
+        "",
+        "## Metrics and assessment",
+        "",
+        "| Tag | Value | Meaning | Assessment |",
+        "|---|---:|---|---|",
+    ]
+
+    meanings = {item[0]: item[4] for item in metrics}
+
+    for key, label, value, unit, meaning in metrics:
+        lines.append(
+            f"| `{key}` ({label}) | {fmt(value, unit)} | "
+            f"{meaning} | {assess(key, value)} |"
+        )
+
+    missing = [
+        key for key, _, value, _, _ in metrics if value is None
+    ]
+
+    lines.extend([
+        "",
+        "## Required follow-up",
+        "",
+    ])
+
+    if missing:
+        lines.append("The following metrics could not be extracted:")
+        lines.extend(f"- `{key}`" for key in missing)
+        lines.append(
+            "- Inspect the corresponding OpenROAD report or log and "
+            "update the extractor to match its actual format."
+        )
+    else:
+        lines.append(
+            "All metrics listed above were extracted. Validate their "
+            "definitions and units before using them for research conclusions."
+        )
+
+    lines.extend([
+        "",
+        "## Extraction caveats",
+        "",
+        f"- Fanout extraction: {pre.get('fanout_method', 'unknown')}.",
+        f"- Cell classification: {pre.get('cell_classification_method', 'unknown')}.",
+        f"- Routing note: {post.get('note', 'No note provided')}",
+        "- A single run cannot establish optimization quality. Compare "
+        "multiple configurations under consistent constraints.",
+        "- For ML, keep post-placement/routing outcomes out of predictor "
+        "features when predicting those same outcomes.",
+        "",
+    ])
+
+    (outdir / "run_report.md").write_text(
+        "\n".join(lines), encoding="utf-8"
+    )
+
+
+
 # ============================================================
 # Main
 # ============================================================
