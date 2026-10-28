@@ -1,57 +1,54 @@
-# FIR Filter Cross-Design Physical-Design Test
+# FIR physical-design final fix
 
-Independent FIR project intended as a **second design family** for testing a placement/timing/congestion model trained on the existing systolic-array data. It does not modify or replace the systolic-array project.
+This package contains replacement files for the existing repository. Copy them into the repository root, preserving the folder paths, and commit the replacements.
 
-## Included
+## Included files
 
-- `rtl/fir_filter.v`: 8-tap signed FIR, 8-bit samples/coefficients, 24-bit accumulator.
-- `tb/tb_fir_filter.v`: basic functional smoke test.
-- `scripts/synth_fir.ys`: Yosys synthesis template, including Sky130 Liberty mapping and netlist/JSON output.
-- `scripts/flow_fir.tcl`: separate OpenROAD floorplan, placement, timing repair, global/detailed routing, ODB/DEF and report generation.
-- `scripts/run_fir_flow.sh`: end-to-end synthesis, SDC generation, OpenROAD and extraction runner.
-- `scripts/extract_fir_features.py`: separates pre-placement netlist predictors from post-placement/routing targets; unavailable measurements remain null.
-- `constraints/fir_filter.sdc.in`: timing-constraint template.
-- `config/sky130_example.env`: paths/settings to edit for your runner.
-- GitHub Actions workflow for RTL simulation only; it does not require or run a PDK/OpenROAD flow.
+- `.github/workflows/fir-physical-design.yml`
+- `fir-filter-cross-design/scripts/run_fir_flow.sh`
+- `fir-filter-cross-design/scripts/flow_fir.tcl`
+- `fir-filter-cross-design/scripts/extract_fir_features.py`
 
-## 1. Run functional simulation
+## What changed
 
-Install Icarus Verilog, then from the project root:
+1. The workflow no longer rewrites `fir_features.csv` after extraction. The extractor is the single owner of that CSV.
+2. Clock-period tags use numeric formatting (`10.0` becomes `10`, while `20` stays `20`).
+3. The runner exports `UTIL`, `PLACE_DENSITY`, `CLK_PERIOD`, `CLK_PERIOD_NS`, `RUN_TAG`, `RUN_DIR`, `NETLIST`, `NETLIST_JSON`, and `SDC` consistently.
+4. The Tcl flow writes `fir_features_status.csv`, `flow_diagnostics.log`, a detailed-routing success marker, and final reports.
+5. Fanout direction extraction uses Yosys JSON directions first, then the selected Liberty file for missing directions. Coverage is recorded for auditability.
+6. Congestion parsing checks the congestion report first, then falls back to the routing/OpenROAD logs if the report does not contain a recognized overflow metric.
+7. Effective placement density is estimated from placed cell areas in the final DEF and LEF macro dimensions divided by DEF placement-row area. It is not copied from the requested target density.
+8. The extractor preserves nested measurement-status data in CSV as JSON text instead of silently dropping dictionary columns.
+9. The GitHub summary shows the measurement-source and quality fields needed to diagnose unavailable metrics.
 
-```bash
-make sim
-```
+## Before committing
 
-## 2. Configure Sky130A paths
-
-Edit `config/sky130_example.env`. Verify all three files exist:
-
-- Sky130A standard-cell Liberty, typically `sky130_fd_sc_hd__tt_025C_5v00.lib`
-- Sky130A technology LEF (`sky130_fd_sc_hd.tlef` or the correct tech LEF for your install)
-- Sky130 HD standard-cell LEF (`sky130_fd_sc_hd.lef`)
-
-The example paths are illustrative. Different PDK distributions place files differently. The `TECH_LEF` path in particular must point to a real technology LEF, not a cell LEF.
-
-## 3. Run synthesis + OpenROAD
-
-Use the same PDK version, Liberty corner, floorplan settings, placement density, clock period, timing margins and routing setup as the systolic-array experiment wherever possible. From the project root:
+Run from the repository root:
 
 ```bash
-./scripts/run_fir_flow.sh
+bash -n fir-filter-cross-design/scripts/run_fir_flow.sh
+python -m py_compile fir-filter-cross-design/scripts/extract_fir_features.py
 ```
 
-The default run is `fir_project/runs/fir_8tap_w8_util40_clk10/`. Change `UTIL`, `CLK_PERIOD`, `PLACE_DENSITY`, and `RUN_TAG` in the environment config to run additional cases. Check that the clock period and constraint semantics match the systolic training data before comparing results.
+The workflow file expects the repository layout shown in your current workflow: `environment.yml` at repository root and the project scripts under `fir-filter-cross-design/`.
 
-Outputs include `final.def`, `final.odb`, setup/hold timing reports when supported by your OpenROAD build, routing congestion report, logs, and feature files. Commands and report names can vary between OpenROAD builds; inspect `openroad_log.txt` and do not treat a missing report as a valid zero measurement.
+## Re-extract an existing run without rerunning OpenROAD
 
-## 4. Feature extraction and ML-safe use
+From `fir-filter-cross-design/`, activate the same environment and make sure `config/sky130_example.env` points to the same Sky130HD Liberty and LEF files used by the run. Then run:
 
-`preplacement_features.csv/json` contains features intended to be available before placement (synthesized netlist structure and known constraints). `physical_targets.csv/json` contains results after placement/routing, such as slack and congestion. Use the former as model inputs and the latter as targets for those same quantities. Do not use post-placement timing, congestion or wirelength as inputs when predicting those metrics.
+```bash
+source config/sky130_example.env
+RUN_TAG=fir_8tap_w8_util40_clk10
+RUN_DIR="fir_project/runs/${RUN_TAG}"
+python3 scripts/extract_fir_features.py \
+  --netlist-json fir_project/synth/fir_filter_netlist.json \
+  --run-dir "$RUN_DIR" \
+  --outdir "$RUN_DIR" \
+  --top fir_filter \
+  --design-id fir_filter_8tap \
+  --run-id "$RUN_TAG" \
+  --taps 8 --data-width 8 --coeff-width 8 --acc-width 24 \
+  --utilization 40 --place-density 0.40 --clock-period 10.0
+```
 
-The extractor is deliberately separate from your existing systolic feature extractor. Its definitions are not automatically identical to your existing 20-column dataset. Before inference or combined training, create a documented schema mapping and verify units/definitions. Do not insert fabricated zeros for unavailable fields. The lightweight script does not claim to measure final routed wirelength; `wirelength_um` remains null unless you add and validate a matching geometry parser or an OpenROAD wirelength report.
-
-## Important limitations
-
-- The coefficient function currently defines exactly eight coefficient values. Keep `TAPS=8` unless you update the RTL and testbench accordingly.
-- This is a starter physical-design flow, not an assertion that every OpenROAD version will accept every command/report exactly as written. Validate against the OpenROAD/PDK build used by the systolic project.
-- A single FIR run is only a pipeline smoke test, not proof of cross-design generalization. Evaluate multiple FIR configurations and keep the trained systolic model frozen during the FIR test.
+This reuses the existing DEF/ODB, reports, logs, synthesized JSON, and configured LEF/Liberty. It does not launch OpenROAD. If the existing run lacks the congestion metric in both the report and logs, that metric will remain unavailable rather than being replaced with zero.
