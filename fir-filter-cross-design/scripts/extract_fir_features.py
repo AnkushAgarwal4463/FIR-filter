@@ -278,6 +278,7 @@ def extract_one(
     row: dict[str, str],
     output_root: Path,
     manifest_dir: Path,
+    output_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Extract synthesis and physical-design features for one run."""
 
@@ -296,7 +297,13 @@ def extract_one(
     design_id = row.get("design_id") or run_id
     requested_top = row.get("top") or "fir_filter"
 
-    run_output = output_root / safe_name(run_id)
+# Direct mode can write to the existing FIR run directory.
+# Manifest mode retains a separate output folder for each run.
+    run_output = (
+        output_dir.resolve()
+        if output_dir is not None
+        else output_root / safe_name(run_id)
+    )
     run_output.mkdir(parents=True, exist_ok=True)
 
     # Extract synthesis/netlist features.
@@ -874,6 +881,23 @@ def main() -> int:
             print(f"[{index}/{len(rows)}] Extracting {run_id} ...")
 
             try:
+            if direct_mode:
+                # Resolve the actual run directory relative to the repository.
+                run_dir = Path(row["run_dir"]).expanduser()
+            
+                if not run_dir.is_absolute():
+                    run_dir = manifest_dir / run_dir
+            
+                run_dir = run_dir.resolve()
+            
+                result = extract_one(
+                    row=row,
+                    output_root=output_root,
+                    manifest_dir=manifest_dir,
+                    output_dir=run_dir,
+                )
+            else:
+                # Keep manifest mode organized into one folder per run.
                 result = extract_one(
                     row=row,
                     output_root=output_root / "runs",
