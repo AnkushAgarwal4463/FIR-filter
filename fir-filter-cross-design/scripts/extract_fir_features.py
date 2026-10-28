@@ -881,43 +881,43 @@ def main() -> int:
             print(f"[{index}/{len(rows)}] Extracting {run_id} ...")
 
             try:
-            if direct_mode:
-                # Resolve the actual run directory relative to the repository.
-                run_dir = Path(row["run_dir"]).expanduser()
-            
-                if not run_dir.is_absolute():
-                    run_dir = manifest_dir / run_dir
-            
-                run_dir = run_dir.resolve()
-            
-                result = extract_one(
-                    row=row,
-                    output_root=output_root,
-                    manifest_dir=manifest_dir,
-                    output_dir=run_dir,
-                )
-            else:
-                # Keep manifest mode organized into one folder per run.
-                result = extract_one(
-                    row=row,
-                    output_root=output_root / "runs",
-                    manifest_dir=manifest_dir,
-                )
+                if direct_mode:
+                    # Resolve the actual run directory relative to the repository.
+                    run_dir = Path(row["run_dir"]).expanduser()
+                
+                    if not run_dir.is_absolute():
+                        run_dir = manifest_dir / run_dir
+                
+                    run_dir = run_dir.resolve()
+                
+                    result = extract_one(
+                        row=row,
+                        output_root=output_root,
+                        manifest_dir=manifest_dir,
+                        output_dir=run_dir,
+                    )
+                else:
+                    # Keep manifest mode organized into one folder per run.
+                    result = extract_one(
+                        row=row,
+                        output_root=output_root / "runs",
+                        manifest_dir=manifest_dir,
+                    )
+    
+                    results.append(result)
+                    print(f"    OK: {result['output_dir']}")
 
-                results.append(result)
-                print(f"    OK: {result['output_dir']}")
-
-            except Exception as exc:
-                failures.append({
-                    "run_id": run_id,
-                    "run_dir": row.get("run_dir"),
-                    "error": str(exc),
-                })
-
-                print(
-                    f"    ERROR: {run_id}: {exc}",
-                    file=sys.stderr,
-                )
+                except Exception as exc:
+                    failures.append({
+                        "run_id": run_id,
+                        "run_dir": row.get("run_dir"),
+                        "error": str(exc),
+                    })
+    
+                    print(
+                        f"    ERROR: {run_id}: {exc}",
+                        file=sys.stderr,
+                    )
 
         if not results:
             write_json(
