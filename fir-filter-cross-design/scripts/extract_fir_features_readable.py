@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """FIR feature extraction helpers used by the multi-run dataset builder."""
 
@@ -116,7 +117,10 @@ def extract_netlist_features(
 
     all_bits: set[int] = set()
     sink_counts: Counter[int] = Counter()
-    directions_found = False
+    cells_with_directions = 0
+    cells_with_complete_directions = 0
+    total_cell_ports = 0
+    ports_with_directions = 0
 
     for obj in list(netnames.values()) + list(ports.values()):
         for bit in obj.get("bits", []):
@@ -127,23 +131,44 @@ def extract_netlist_features(
         connections = cell.get("connections", {})
         directions = cell.get("port_directions", {})
 
-        if isinstance(directions, dict) and directions:
-            directions_found = True
+        if not isinstance(connections, dict):
+            continue
+        if not isinstance(directions, dict):
+            directions = {}
 
+        if directions:
+            cells_with_directions += 1
+
+        cell_complete = bool(connections)
         for port_name, bits in connections.items():
+            total_cell_ports += 1
             direction = str(directions.get(port_name, "")).lower()
+
+            if direction in {"input", "output", "inout"}:
+                ports_with_directions += 1
+            else:
+                cell_complete = False
 
             for bit in bits:
                 if isinstance(bit, int) and not isinstance(bit, bool):
                     all_bits.add(bit)
-
                     if direction == "input":
                         sink_counts[bit] += 1
 
-    fanouts = (
-        [sink_counts[bit] for bit in all_bits if sink_counts[bit] > 0]
-        if directions_found
-        else []
+        if cell_complete:
+            cells_with_complete_directions += 1
+
+    fanouts = [
+        sink_counts[bit]
+        for bit in all_bits
+        if sink_counts[bit] > 0
+    ]
+
+    directions_found = cells_with_directions > 0
+    coverage_fraction = (
+        ports_with_directions / total_cell_ports
+        if total_cell_ports
+        else None
     )
 
     net_bit_total = sum(
@@ -177,6 +202,24 @@ def extract_netlist_features(
             else (0.0 if fanouts else None)
         ),
         "fanout_direction_metadata_found": directions_found,
+        "fanout_total_cells": len(cells),
+        "fanout_cells_with_any_directions": cells_with_directions,
+        "fanout_cells_with_complete_directions": cells_with_complete_directions,
+        "fanout_direction_coverage_fraction": coverage_fraction,
+        "fanout_direction_coverage_percent": (
+            coverage_fraction * 100.0
+            if coverage_fraction is not None
+            else None
+        ),
+        "fanout_metadata_complete_for_all_cells": (
+            cells_with_complete_directions == len(cells)
+        ),
+        "fanout_quality_warning": (
+            "Direction metadata missing or incomplete; fanout may be "
+            "under-counted."
+            if cells_with_complete_directions < len(cells)
+            else None
+        ),
         "fanout_method": (
             "Yosys cell input-port directions"
             if directions_found
@@ -192,6 +235,7 @@ def extract_netlist_features(
 
 
 def last_number(text: str, patterns: list[str]) -> float | None:
+    """Return the last valid match from the first pattern that matches."""
     for pattern in patterns:
         matches = list(re.finditer(pattern, text, re.I | re.M))
 
@@ -204,7 +248,7 @@ def last_number(text: str, patterns: list[str]) -> float | None:
 
 
 def collect_logs(run_dir: Path) -> dict[str, str]:
-    """Collect log and text files recursively."""
+    """Collect non-empty log and text files recursively."""
     if not run_dir.is_dir():
         return {}
 
@@ -227,7 +271,7 @@ def collect_logs(run_dir: Path) -> dict[str, str]:
         )
     )
 
-    result = {}
+    result: dict[str, str] = {}
     for path in paths:
         content = read_text(path)
         if content.strip():
@@ -237,6 +281,7 @@ def collect_logs(run_dir: Path) -> dict[str, str]:
 
 
 def choose_routing_log(logs: dict[str, str]) -> tuple[str | None, str]:
+    """Prefer a detailed-routing log over a general OpenROAD log."""
     priority = (
         "5_2_route.log",
         "detailed_route.log",
@@ -244,16 +289,17 @@ def choose_routing_log(logs: dict[str, str]) -> tuple[str | None, str]:
         "flow_diagnostics.log",
     )
 
+    route_pattern = re.compile(
+        r"detailed routing|detail routing|total wire length|"
+        r"number of vias|violations",
+        re.I,
+    )
+
     for wanted in priority:
         for name, content in logs.items():
             if (
                 Path(name).name.lower() == wanted
-                and re.search(
-                    r"detailed routing|detail routing|total wire length|"
-                    r"number of vias|violations",
-                    content,
-                    re.I,
-                )
+                and route_pattern.search(content)
             ):
                 return name, content
 
@@ -366,12 +412,14 @@ def parse_route_log(text: str) -> dict[str, Any]:
 
 
 def parse_congestion(text: str) -> float | None:
+    """Parse an explicitly reported overflow metric; never infer zero."""
     value = last_number(
         text,
         [
             rf"\btotal\s+(?:routing\s+)?overflow\s*[:=]\s*({NUM})",
             rf"\bcongestion\s+overflow\s*[:=]\s*({NUM})",
             rf"\brouting\s+overflow\s*[:=]\s*({NUM})",
+            rf"\btotal\s+overflow\s+(?:is|of)\s+({NUM})",
         ],
     )
 
@@ -379,7 +427,8 @@ def parse_congestion(text: str) -> float | None:
         return value
 
     if re.search(
-        r"\b(?:no overflowing gcells|no overflowing gcell|zero routing overflow)\b",
+        r"\b(?:no overflowing gcells|no overflowing gcell|"
+        r"zero routing overflow|no routing overflow)\b",
         text,
         re.I,
     ):
@@ -389,14 +438,23 @@ def parse_congestion(text: str) -> float | None:
 
 
 def parse_physical_log_values(text: str) -> dict[str, Any]:
+    """Extract explicit physical metrics from logs.
+
+    Generic target-density settings are deliberately not treated as
+    measured effective placement density.
+    """
     density = last_number(
         text,
         [
+            rf"\beffective\s+(?:global\s+)?placement\s+density\s*[:=]\s*({NUM})",
+            rf"\bachieved\s+(?:global\s+)?placement\s+density\s*[:=]\s*({NUM})",
+            rf"\bactual\s+(?:global\s+)?placement\s+density\s*[:=]\s*({NUM})",
+            rf"\beffective\s+density\s*[:=]\s*({NUM})",
             rf"\buniform density\s+to\s+({NUM})",
             rf"\b(?:auto(?:matically)?\s+)?adjust(?:s|ed|ing)?\s+uniform density\s+to\s+({NUM})",
-            rf"\beffective\s+(?:placement\s+)?density\s*[:=]\s*({NUM})",
         ],
     )
+
     area = last_number(
         text,
         [
@@ -484,15 +542,22 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
     setup_src = setup_text or all_logs
     tns_src = tns_text or all_logs
     hold_src = hold_text or all_logs
-    cong_src = cong_text or all_logs
 
     wns_setup = parse_timing(setup_src, "wns_setup_ns")
     tns_setup = parse_timing(tns_src, "tns_setup_ns")
     wns_hold = parse_timing(hold_src, "wns_hold_ns")
 
     route = parse_route_log(route_text)
-    congestion = parse_congestion(cong_src)
     physical = parse_physical_log_values(all_logs)
+
+    # Try the congestion report first. If it exists but its format is not
+    # recognized, try the logs as well.
+    congestion = parse_congestion(cong_text) if cong_text else None
+    if congestion is not None:
+        congestion_source = str(cong_path)
+    else:
+        congestion = parse_congestion(all_logs)
+        congestion_source = "logs" if congestion is not None else None
 
     def_counts = (
         parse_def_routing(def_text)
@@ -519,16 +584,24 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "wns_setup_ns": "measured" if wns_setup is not None else "unavailable",
         "tns_setup_ns": "measured" if tns_setup is not None else "unavailable",
         "wns_hold_ns": "measured" if wns_hold is not None else "unavailable",
-        "congestion_overflow": "measured" if congestion is not None else "unavailable",
-        "wirelength_um": "measured" if route["wirelength_um"] is not None else "unavailable",
-        "via_count": "measured" if route["via_count"] is not None else "unavailable",
+        "congestion_overflow": (
+            "measured" if congestion is not None else "unavailable"
+        ),
+        "wirelength_um": (
+            "measured" if route["wirelength_um"] is not None else "unavailable"
+        ),
+        "via_count": (
+            "measured" if route["via_count"] is not None else "unavailable"
+        ),
         "final_detailed_route_violations": (
             "measured"
             if route["final_detailed_route_violations"] is not None
             else "unavailable"
         ),
         "design_area_um2": (
-            "measured" if physical["design_area_um2"] is not None else "unavailable"
+            "measured"
+            if physical["design_area_um2"] is not None
+            else "unavailable"
         ),
     }
 
@@ -545,19 +618,26 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "tns_setup_ns": tns_setup,
         "wns_hold_ns": wns_hold,
         "congestion_overflow": congestion,
-        "setup_report_source": str(setup_path) if setup_path else ("logs" if setup_src else None),
-        "tns_report_source": str(tns_path) if tns_path else ("logs" if tns_src else None),
-        "hold_report_source": str(hold_path) if hold_path else ("logs" if hold_src else None),
-        "congestion_report_source": str(cong_path) if cong_path else ("logs" if cong_src else None),
+        "setup_report_source": (
+            str(setup_path) if setup_path else ("logs" if setup_src else None)
+        ),
+        "tns_report_source": (
+            str(tns_path) if tns_path else ("logs" if tns_src else None)
+        ),
+        "hold_report_source": (
+            str(hold_path) if hold_path else ("logs" if hold_src else None)
+        ),
+        "congestion_report_source": congestion_source,
         "routing_log_source": route_name,
         "log_files_found": list(logs),
         "target_measurement_status": measurements,
         "note": (
             "DEF route counts are approximate. Cell classes are heuristic and "
-            "should be validated against Liberty. Fanout is unavailable if "
-            "Yosys port directions are missing. Router violations are not "
-            "independent signoff DRC. Congestion remains null unless a "
-            "recognized overflow metric is found."
+            "should be validated against Liberty. Fanout depends on Yosys port "
+            "direction metadata. Router violations are not independent signoff "
+            "DRC. Congestion remains null unless a recognized overflow metric "
+            "is found. Effective placement density remains null unless an "
+            "explicit supported density message is found."
         ),
         "target_feature_stage": (
             "post-placement/routing targets; exclude these outcomes from "
