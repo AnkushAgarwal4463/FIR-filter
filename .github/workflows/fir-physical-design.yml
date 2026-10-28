@@ -263,6 +263,7 @@ jobs:
             "$STATUS" "$STAGE" >> "$CSV"
 
           echo "Configuration CSV created: $CSV"
+          cat "$CSV"
 
       - name: Create tabular feature summary
         if: always()
@@ -279,20 +280,41 @@ jobs:
           RUN_DIR="fir_project/runs/${RUN_TAG}"
 
           export FIR_SUMMARY_RUN_DIR="$RUN_DIR"
-          export SUMMARY_FILE="$GITHUB_STEP_SUMMARY"
+          export SUMMARY_FILE="${GITHUB_STEP_SUMMARY:?GITHUB_STEP_SUMMARY is not set}"
 
-          echo "Using run directory: $FIR_SUMMARY_RUN_DIR"
+          echo "===== Summary diagnostics ====="
+          echo "Working directory: $PWD"
+          echo "Run directory: $FIR_SUMMARY_RUN_DIR"
+          echo "Summary file: $SUMMARY_FILE"
 
-          python - <<'PY'
+          echo "===== CSV availability ====="
+          for file in \
+            features.csv \
+            fir_features.csv \
+            physical_targets.csv \
+            preplacement_features.csv
+          do
+            if [[ -s "$RUN_DIR/$file" ]]; then
+              echo "FOUND: $RUN_DIR/$file"
+              wc -l "$RUN_DIR/$file"
+            else
+              echo "MISSING OR EMPTY: $RUN_DIR/$file"
+            fi
+          done
+
+          echo "===== Starting Python summary generator ====="
+
+          python -u - <<'PY'
           import csv
           import os
+          import sys
           from pathlib import Path
 
           run_dir = Path(os.environ["FIR_SUMMARY_RUN_DIR"])
           summary_path = Path(os.environ["SUMMARY_FILE"])
 
           def markdown_cell(value):
-              value = str(value if value is not None else "")
+              value = "" if value is None else str(value)
               return (
                   value.replace("|", "\\|")
                   .replace("\r", " ")
@@ -304,25 +326,33 @@ jobs:
               out.write(f"## {title}\n\n")
 
               if not path.is_file():
-                  out.write(f"CSV not found: `{filename}`\n\n")
+                  out.write(f"> CSV not found: `{filename}`\n\n")
+                  print(f"WARNING: CSV not found: {path}")
                   return
 
-              with path.open(
-                  "r", newline="", encoding="utf-8-sig"
-              ) as handle:
-                  reader = csv.DictReader(handle)
-                  headers = reader.fieldnames or []
-                  rows = list(reader)
+              try:
+                  with path.open(
+                      "r", newline="", encoding="utf-8-sig"
+                  ) as handle:
+                      reader = csv.DictReader(handle)
+                      headers = reader.fieldnames or []
+                      rows = list(reader)
+              except (OSError, csv.Error, UnicodeError) as exc:
+                  out.write(f"> Could not read `{filename}`: {exc}\n\n")
+                  print(f"ERROR: Could not read {path}: {exc}")
+                  return
 
               if not headers:
-                  out.write("**CSV has no header row.**\n\n")
+                  out.write("> CSV has no header row.\n\n")
+                  print(f"WARNING: No header row in {path}")
                   return
 
               if not rows:
                   out.write(
-                      "**No data rows found.** The CSV contains a header "
+                      "> No data rows found. The CSV contains a header "
                       "but no records.\n\n"
                   )
+                  print(f"WARNING: Header-only CSV: {path}")
                   return
 
               selected = [name for name in columns if name in headers]
@@ -330,24 +360,34 @@ jobs:
               if not selected:
                   selected = headers
 
-              out.write("| " + " | ".join(selected) + " |\n")
-              out.write("| " + " | ".join("---" for _ in selected) + " |\n")
+              out.write("| " + " | ".join(
+                  markdown_cell(name) for name in selected
+              ) + " |\n")
+
+              out.write("| " + " | ".join(
+                  "---" for _ in selected
+              ) + " |\n")
 
               for row in rows:
-                  out.write(
-                      "| "
-                      + " | ".join(
-                          markdown_cell(row.get(name, ""))
-                          for name in selected
-                      )
-                      + " |\n"
-                  )
+                  out.write("| " + " | ".join(
+                      markdown_cell(row.get(name, ""))
+                      for name in selected
+                  ) + " |\n")
 
               out.write("\n")
+              print(
+                  f"Rendered {filename}: {len(rows)} data row(s), "
+                  f"{len(selected)} column(s)"
+              )
+
+          print(f"Python: {sys.version}")
+          print(f"Run directory exists: {run_dir.is_dir()}")
+          print(f"Summary file: {summary_path}")
 
           with summary_path.open("a", encoding="utf-8") as out:
               out.write("# FIR Physical-Design Results\n\n")
               out.write(f"**Run:** `{run_dir.name}`\n\n")
+              out.write(f"**Run directory:** `{run_dir}`\n\n")
 
               render_csv(
                   out,
@@ -439,7 +479,18 @@ jobs:
                       "place_density",
                   ],
               )
+
+              out.write(
+                  "---\n\n"
+                  "Generated by the FIR Physical Design workflow.\n"
+              )
+
+          print("SUCCESS: Summary Markdown was written.")
           PY
+
+          echo "===== Summary file written ====="
+          ls -lh "$SUMMARY_FILE"
+          tail -n 35 "$SUMMARY_FILE"
 
       - name: Display CSV file locations
         if: always()
@@ -464,6 +515,7 @@ jobs:
 
             if [[ -s "$file" ]]; then
               echo "AVAILABLE: $file"
+              wc -l "$file"
             else
               echo "MISSING OR EMPTY: $file"
             fi
