@@ -84,13 +84,37 @@ if ! openroad -exit scripts/flow_fir.tcl \
     exit 4
 fi
 
-echo "===== Extract physical-design features ====="
+
+echo "===== Extract physical-design features and generate report ====="
+
 python3 scripts/extract_fir_features.py \
     --netlist-json "$NETLIST_JSON" \
     --run-dir "$RUN_DIR" \
     --outdir "$RUN_DIR" \
+    --design-id "fir_filter_8tap" \
+    --run-id "$RUN_TAG" \
+    --taps 8 \
+    --data-width 8 \
+    --coeff-width 8 \
+    --acc-width 24 \
     --utilization "$UTIL" \
+    --place-density "$PLACE_DENSITY" \
     --clock-period "$CLK_PERIOD"
+
+echo "===== Generated reports ====="
+for f in \
+    "$RUN_DIR/run_report.md" \
+    "$RUN_DIR/features.csv" \
+    "$RUN_DIR/physical_targets.csv" \
+    "$RUN_DIR/fir_features.csv"
+do
+    if [[ -s "$f" ]]; then
+        echo "FOUND: $f"
+    else
+        echo "WARNING: Missing or empty: $f"
+    fi
+done
 
 echo "FIR flow finished."
 echo "Review outputs under: $RUN_DIR"
+
