@@ -759,7 +759,7 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
     def_ok = def_path.is_file() and def_path.stat().st_size > 0
     odb_ok = odb_path.is_file() and odb_path.stat().st_size > 0
 
-     measurements = {
+    measurements = {
         "wns_setup_ns": "measured" if wns_setup is not None else "unavailable",
         "tns_setup_ns": "measured" if tns_setup is not None else "unavailable",
         "wns_hold_ns": "measured" if wns_hold is not None else "unavailable",
