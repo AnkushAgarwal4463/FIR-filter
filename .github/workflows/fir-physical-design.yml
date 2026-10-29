@@ -190,6 +190,75 @@ jobs:
           chmod +x scripts/run_fir_flow.sh
           ./scripts/run_fir_flow.sh
 
+      
+      - name: Diagnose congestion and fanout inputs
+        if: always()
+        run: |
+          set -u
+
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN { printf "%g", c + 0 }')"
+          RUN_DIR="fir_project/runs/fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
+          NETLIST_JSON="fir_project/synth/fir_filter_netlist.json"
+
+          echo "===== RUN DIRECTORY: $RUN_DIR ====="
+
+          echo "===== CONGESTION OVERFLOW REPORT ====="
+          if [[ -s "$RUN_DIR/congestion_overflow.rpt" ]]; then
+            cat "$RUN_DIR/congestion_overflow.rpt"
+          else
+            echo "MISSING OR EMPTY: congestion_overflow.rpt"
+          fi
+
+          echo "===== GLOBAL ROUTING CONGESTION REPORT ====="
+          if [[ -s "$RUN_DIR/congestion.rpt" ]]; then
+            sed -n '1,120p' "$RUN_DIR/congestion.rpt"
+          else
+            echo "MISSING OR EMPTY: congestion.rpt"
+          fi
+
+          echo "===== CONGESTION MARKERS IN LOGS ====="
+          grep -n -i -E \
+            'GLOBAL_ROUTE_HAS_CONGESTION|GLOBAL_ROUTE_STATUS|overflow|congestion' \
+            "$RUN_DIR/flow_diagnostics.log" "$RUN_DIR/openroad_log.txt" \
+            2>/dev/null || true
+
+          echo "===== NETLIST JSON STRUCTURE ====="
+          python - "$NETLIST_JSON" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          if not path.is_file():
+              print(f"MISSING: {path}")
+              raise SystemExit(0)
+
+          try:
+              data = json.loads(path.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError) as exc:
+              print(f"Could not parse JSON: {exc}")
+              raise SystemExit(0)
+
+          print("Top-level keys:", list(data.keys()))
+          modules = data.get("modules", {})
+          print("Modules:", list(modules.keys()))
+
+          for module_name, module in modules.items():
+              print(f"\nMODULE: {module_name}")
+              ports = module.get("ports", {})
+              cells = module.get("cells", {})
+              print("Module keys:", list(module.keys()))
+              print("Port count:", len(ports))
+              for name, port in list(ports.items())[:5]:
+                  print("PORT SAMPLE:", name, json.dumps(port))
+
+              print("Cell count:", len(cells))
+              for name, cell in list(cells.items())[:2]:
+                  print(f"CELL SAMPLE: {name}")
+                  print(json.dumps(cell, indent=2)[:2500])
+          PY
+    
+
       # Do not add a post-flow step that rewrites fir_features.csv.
       # The extractor reads Tcl status history and owns this CSV output.
 
