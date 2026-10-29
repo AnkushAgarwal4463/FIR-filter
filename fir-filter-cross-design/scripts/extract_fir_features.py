@@ -337,9 +337,26 @@ def extract_netlist_features(path: Path, requested_top: str, design_id: str) -> 
         directions = cell.get("port_directions", {})
         if not isinstance(directions, dict):
             directions = {}
-        cell_type = str(cell.get("type", ""))
-        liberty_cell = liberty_directions.get(cell_type, {})
-        resolved = {**liberty_cell, **directions}  # Yosys metadata takes precedence.
+        
+        cell_type = str(cell.get("type", "")).strip().strip('"').lstrip("\\")
+        liberty_cell = next(
+            (
+                pins for liberty_name, pins in liberty_directions.items()
+                if liberty_name.strip().strip('"').lstrip("\\").lower()
+                == cell_type.lower()
+            ),
+            {},
+        )
+        
+        resolved = {
+            str(pin_name).strip().strip('"').lower(): str(direction).lower()
+            for pin_name, direction in liberty_cell.items()
+        }
+        resolved.update({
+            str(pin_name).strip().strip('"').lower(): str(direction).lower()
+            for pin_name, direction in directions.items()
+        })
+
         if resolved:
             cells_with_any_directions += 1
         complete = True
@@ -347,7 +364,7 @@ def extract_netlist_features(path: Path, requested_top: str, design_id: str) -> 
         # A cell with no connections contributes no unresolved pin directions.
         # For connected cells, every pin direction must be known.
         for port_name, bits in connections.items():
-            direction = str(resolved.get(port_name, "")).lower()
+            direction = resolved.get(str(port_name).strip().strip('"').lower(), "")
             port_count_total += 1
             if direction in {"input", "output", "inout"}:
                 port_count_known += 1
@@ -484,26 +501,19 @@ def parse_route_log(text: str) -> dict[str, Any]:
 
 
 
-def parse_congestion(text: str) -> float | None:
-    """Extract an explicitly reported congestion-overflow value.
 
-    Returns None when no recognized numeric metric is available.
-    Does not infer zero from an empty or unrecognized report.
+def parse_congestion(text: str) -> float | None:
+    """Extract a numeric routing-overflow value only when explicitly reported.
+
+    A Boolean congestion status is not treated as a numeric overflow value.
     """
     if not text or not text.strip():
         return None
 
     patterns = [
-        # Examples: Total overflow: 0; Total overflow = 12
         rf"(?im)^\s*total\s+(?:routing\s+)?overflow\s*[:=]\s*({NUM})\b",
-
-        # Examples: Routing overflow: 5; Global routing overflow = 3
         rf"(?im)^\s*(?:(?:global|detailed)\s+)?routing\s+overflow\s*[:=]\s*({NUM})\b",
-
-        # Examples: Congestion overflow: 2
         rf"(?im)^\s*congestion\s+overflow\s*[:=]\s*({NUM})\b",
-
-        # Explicitly labelled overflow values in log messages
         rf"(?im)^.*?\btotal\s+overflow\s+(?:is|of)\s+({NUM})\b",
         rf"(?im)^.*?\b(?:global\s+)?routing\s+overflow\s+(?:is|of)\s+({NUM})\b",
         rf"(?im)^.*?\bcongestion\s+overflow\s+(?:is|of)\s+({NUM})\b",
@@ -513,8 +523,6 @@ def parse_congestion(text: str) -> float | None:
     if value is not None:
         return value
 
-    # Accept zero only when the report explicitly states that no
-    # overflow occurred or explicitly reports a zero total.
     explicit_zero_patterns = [
         r"\bno\s+overflowing\s+gcells?\b",
         r"\bzero\s+routing\s+overflow\b",
@@ -522,13 +530,26 @@ def parse_congestion(text: str) -> float | None:
         r"\btotal\s+overflow\s+(?:is|of)\s+0(?:\.0*)?(?![\d.eE])",
     ]
 
-    if any(
-        re.search(pattern, text, re.I)
-        for pattern in explicit_zero_patterns
-    ):
+    if any(re.search(pattern, text, re.I) for pattern in explicit_zero_patterns):
         return 0.0
 
     return None
+
+
+def parse_congestion_status(text: str) -> str | None:
+    """Read an explicitly recorded global-routing congestion status."""
+    if not text:
+        return None
+
+    match = re.search(
+        r"(?im)^\s*GLOBAL_ROUTE_HAS_CONGESTION:\s*(true|false|0|1)\b",
+        text,
+    )
+    if not match:
+        return None
+
+    return "yes" if match.group(1).lower() in {"true", "1"} else "no"
+
 
 def parse_physical_log_values(text: str) -> dict[str, Any]:
     density = last_number(text, [
@@ -632,15 +653,18 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
     )
 
     # Other physical reports.
+ 
     cong_path, cong_text = find_report(
         run_dir,
         [
+            "congestion_overflow.rpt",
             "congestion.rpt",
             "global_route_congestion.rpt",
             "routing_congestion.rpt",
             "grt_congestion.rpt",
         ],
     )
+
 
     area_path, area_text = find_report(
         run_dir,
@@ -651,6 +675,10 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
     logs = collect_logs(run_dir)
     route_name, route_text = choose_routing_log(logs)
     all_logs = "\n".join(logs.values())
+
+    congestion_status = parse_congestion_status(
+        "\n".join([cong_text, all_logs])
+    )
 
     # Parse each timing metric independently.
     # Do not use one generic timing parser for setup and hold.
@@ -731,17 +759,19 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
     def_ok = def_path.is_file() and def_path.stat().st_size > 0
     odb_ok = odb_path.is_file() and odb_path.stat().st_size > 0
 
-    measurements = {
+     measurements = {
         "wns_setup_ns": "measured" if wns_setup is not None else "unavailable",
         "tns_setup_ns": "measured" if tns_setup is not None else "unavailable",
         "wns_hold_ns": "measured" if wns_hold is not None else "unavailable",
         "congestion_overflow": "measured" if congestion is not None else "unavailable",
+        "congestion_status": "measured" if congestion_status is not None else "unavailable",
         "wirelength_um": "measured" if route["wirelength_um"] is not None else "unavailable",
         "via_count": "measured" if route["via_count"] is not None else "unavailable",
         "final_detailed_route_violations": "measured" if route["final_detailed_route_violations"] is not None else "unavailable",
         "design_area_um2": "measured" if physical["design_area_um2"] is not None else "unavailable",
         "effective_place_density": "measured" if density_measurement["effective_place_density"] is not None else "unavailable",
     }
+
     return {
         "final_def_available": def_path.is_file(),
         "final_odb_available": odb_path.is_file(),
@@ -755,10 +785,9 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "placement_row_area_um2": density_measurement.get("placement_row_area_um2"),
         "effective_place_density_method": density_measurement.get("effective_place_density_method"),
         "design_area_um2": physical["design_area_um2"],
-        "wns_setup_ns": wns_setup,
-        "tns_setup_ns": tns_setup,
         "wns_hold_ns": wns_hold,
         "congestion_overflow": congestion,
+        "congestion_status": congestion_status,
         "setup_report_source": str(setup_path) if setup_path else ("logs" if setup_src else None),
         "tns_report_source": str(tns_path) if tns_path else ("logs" if tns_src else None),
         "hold_report_source": str(hold_path) if hold_path else ("logs" if hold_src else None),
@@ -870,7 +899,9 @@ DISPLAY_NAMES = {
     "placed_cell_area_from_def_um2": "Placed cell area from DEF (µm²)", "placement_row_area_um2": "Placement row area (µm²)",
     "design_area_um2": "Design area (µm²)",
     "wns_setup_ns": "Setup WNS (ns)", "tns_setup_ns": "Setup TNS (ns)",
-    "wns_hold_ns": "Hold WNS (ns)", "congestion_overflow": "Congestion overflow",
+    "wns_hold_ns": "Hold WNS (ns)",
+    "congestion_overflow": "Congestion overflow",
+    "congestion_status": "Routing congestion status",
     "setup_report_source": "Setup timing report source", "tns_report_source": "TNS report source",
     "hold_report_source": "Hold timing report source", "congestion_report_source": "Congestion report source",
     "routing_log_source": "Routing log source", "note": "Notes / limitations",
@@ -934,7 +965,7 @@ def write_human_report(outdir: Path, pre: dict[str, Any], post: dict[str, Any], 
         "detailed_route_success_marker_found", "routed_net_count", "route_segment_count", "wirelength_um",
         "via_count", "final_detailed_route_violations", "effective_place_density",
         "effective_place_density_method", "placed_cell_area_from_def_um2", "placement_row_area_um2",
-        "design_area_um2", "wns_setup_ns", "tns_setup_ns", "wns_hold_ns", "congestion_overflow",
+        "design_area_um2", "wns_setup_ns", "tns_setup_ns", "wns_hold_ns", "congestion_overflow", "congestion_status",
     ]
     synthesis_keys = [
         "cell_count", "netname_count", "port_count", "port_bit_count", "sequential_cell_count",
