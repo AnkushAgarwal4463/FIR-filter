@@ -298,6 +298,28 @@ def extract_netlist_features(path: Path, requested_top: str, design_id: str) -> 
 
     liberty_path = configured_path("LIBERTY")
     liberty_directions = load_liberty_pin_directions(liberty_path)
+    
+    # Temporary diagnostics: verify Liberty parsing and cell-name matching.
+    netlist_cell_types = {
+        str(cell.get("type", "")).lstrip("\\")
+        for cell in cells.values()
+    }
+
+    matched_types = netlist_cell_types & set(liberty_directions)
+
+    print("\n===== Liberty Fanout Diagnostics =====")
+    print(f"LIBERTY path: {liberty_path}")
+    print(
+        "LIBERTY file exists: "
+        f"{liberty_path.is_file() if liberty_path else False}"
+    )
+    print(f"Liberty cells parsed: {len(liberty_directions)}")
+    print(f"Unique netlist cell types: {len(netlist_cell_types)}")
+    print(f"Matching cell types: {len(matched_types)}")
+    print(f"Sample netlist cell types: {sorted(netlist_cell_types)[:10]}")
+    print(f"Sample Liberty cell types: {list(liberty_directions)[:10]}")
+    print("======================================\n")
+
     all_bits: set[int] = set()
     sink_counts: Counter[int] = Counter()
     port_count_total = 0
