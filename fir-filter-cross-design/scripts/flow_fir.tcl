@@ -94,12 +94,40 @@ if {[catch {repair_timing -setup -setup_margin 0.2} result]} {
     fir_log "OPTIONAL_STEP_COMPLETED: repair_timing"
 }
 
-# Global route and congestion measurement.
-fir_step "global_routing" [list global_route -congestion_report_file "$::env(RUN_DIR)/congestion.rpt"]
+
+# Global route and explicit congestion measurement.
+set congestion_report "$::env(RUN_DIR)/congestion.rpt"
+
+fir_step "global_routing" [list global_route \
+    -congestion_report_file $congestion_report -verbose]
+
+# Capture whether global routing reports any remaining congestion.
+if {[catch {has_congestion} congestion_flag]} {
+    fir_log "GLOBAL_ROUTE_HAS_CONGESTION: unavailable ($congestion_flag)"
+} else {
+    fir_log "GLOBAL_ROUTE_HAS_CONGESTION: $congestion_flag"
+
+    if {$congestion_flag} {
+        if {[catch {report_congestion} congestion_output]} {
+            fir_log "WARNING: report_congestion failed: $congestion_output"
+        } else {
+            set fd [open "$::env(RUN_DIR)/congestion_overflow.rpt" w]
+            puts $fd $congestion_output
+            close $fd
+        }
+    } else {
+        set fd [open "$::env(RUN_DIR)/congestion_overflow.rpt" w]
+        puts $fd "GLOBAL_ROUTE_HAS_CONGESTION: 0"
+        puts $fd "No remaining global-routing congestion reported."
+        close $fd
+    }
+}
+
 fir_step "estimate_global_route_parasitics" [list estimate_parasitics -global_routing]
 catch {report_checks -path_delay max -format full_clock_expanded > "$::env(RUN_DIR)/timing_setup_global_route.rpt"}
 catch {report_worst_slack -max > "$::env(RUN_DIR)/wns_setup_global_route.rpt"}
 catch {report_tns > "$::env(RUN_DIR)/tns_setup_global_route.rpt"}
+
 
 # Detailed routing. The explicit marker is consumed by the feature extractor.
 fir_step "detailed_routing" [list detailed_route]
