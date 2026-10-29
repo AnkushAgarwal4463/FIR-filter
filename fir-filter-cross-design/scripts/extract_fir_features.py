@@ -163,7 +163,7 @@ def load_liberty_pin_directions(path: Path | None) -> dict[str, dict[str, str]]:
         for pin_match in re.finditer(r"\bpin\s*\(\s*\"?([^\)\"\s]+)\"?\s*\)\s*\{", body, re.I):
             pin_name = pin_match.group(1)
             pin_body = _balanced_block(body, pin_match.end() - 1)
-            direction = re.search(r"\bdirection\s*:\s*(input|output|inout)\s*;", pin_body, re.I)
+            direction = re.search(r"\bdirection\s*:\s*\"?(input|output|inout)\"?\s*;", pin_body, re.I)
             if direction:
                 pins[pin_name] = direction.group(1).lower()
         if pins:
@@ -320,6 +320,12 @@ def extract_netlist_features(path: Path, requested_top: str, design_id: str) -> 
     print(f"Sample Liberty cell types: {list(liberty_directions)[:10]}")
     print("======================================\n")
 
+    # Normalize names once so each netlist cell lookup is constant-time.
+    liberty_by_name = {
+        name.strip().strip('"').lstrip("\\").lower(): pins
+        for name, pins in liberty_directions.items()
+    }
+
     all_bits: set[int] = set()
     sink_counts: Counter[int] = Counter()
     port_count_total = 0
@@ -339,14 +345,7 @@ def extract_netlist_features(path: Path, requested_top: str, design_id: str) -> 
             directions = {}
         
         cell_type = str(cell.get("type", "")).strip().strip('"').lstrip("\\")
-        liberty_cell = next(
-            (
-                pins for liberty_name, pins in liberty_directions.items()
-                if liberty_name.strip().strip('"').lstrip("\\").lower()
-                == cell_type.lower()
-            ),
-            {},
-        )
+        liberty_cell = liberty_by_name.get(cell_type.lower(), {})
         
         resolved = {
             str(pin_name).strip().strip('"').lower(): str(direction).lower()
@@ -509,6 +508,15 @@ def parse_congestion(text: str) -> float | None:
     """
     if not text or not text.strip():
         return None
+
+    # OpenROAD global_route -verbose prints a per-layer table whose last
+    # column is "Max H / Max V / Total Overflow". Use the last "Total" row.
+    grt_total = re.findall(
+        rf"(?im)^\s*Total\s+{NUM}\s+{NUM}\s+{NUM}%\s+({NUM})\s*/\s*({NUM})\s*/\s*({NUM})\s*$",
+        text,
+    )
+    if grt_total:
+        return float(grt_total[-1][2])
 
     patterns = [
         rf"(?im)^\s*total\s+(?:routing\s+)?overflow\s*[:=]\s*({NUM})\b",
@@ -785,6 +793,8 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "placement_row_area_um2": density_measurement.get("placement_row_area_um2"),
         "effective_place_density_method": density_measurement.get("effective_place_density_method"),
         "design_area_um2": physical["design_area_um2"],
+        "wns_setup_ns": wns_setup,
+        "tns_setup_ns": tns_setup,
         "wns_hold_ns": wns_hold,
         "congestion_overflow": congestion,
         "congestion_status": congestion_status,
@@ -1118,4 +1128,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
