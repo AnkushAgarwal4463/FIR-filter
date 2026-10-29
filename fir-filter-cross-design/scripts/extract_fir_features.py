@@ -171,33 +171,54 @@ def load_liberty_pin_directions(path: Path | None) -> dict[str, dict[str, str]]:
     return result
 
 
-def load_lef_sizes(path: Path | None) -> tuple[dict[str, tuple[float, float]], dict[str, tuple[float, float]]]:
-    """Return LEF macro and site dimensions in microns."""
-    macros: dict[str, tuple[float, float]] = {}
-    sites: dict[str, tuple[float, float]] = {}
-    if path is None or not path.is_file():
-        return macros, sites
-    text = read_text(path)
-    size_re = re.compile(rf"\bSIZE\s+({NUM})\s+BY\s+({NUM})\s*;", re.I)
-    for match in re.finditer(r"(?mi)^\s*MACRO\s+(\S+)\s*$", text):
-        name = match.group(1)
-        end = re.search(rf"(?mi)^\s*END\s+{re.escape(name)}\s*$", text[match.end():])
-        if not end:
+
+def load_lef_sizes(paths):
+    """Read standard-cell macro and site dimensions from one or more LEF files."""
+    if paths is None:
+        paths = []
+    elif isinstance(paths, (str, Path)):
+        paths = [paths]
+
+    macros = {}
+    sites = {}
+    size_re = re.compile(
+        rf"\bSIZE\s+({NUM})\s+BY\s+({NUM})\s*;",
+        re.I,
+    )
+
+    for path in paths:
+        if path is None:
             continue
-        body = text[match.end():match.end() + end.start()]
-        size = size_re.search(body)
-        if size:
-            macros[name] = (float(size.group(1)), float(size.group(2)))
-    for match in re.finditer(r"(?mi)^\s*SITE\s+(\S+)\s*$", text):
-        name = match.group(1)
-        end = re.search(rf"(?mi)^\s*END\s+{re.escape(name)}\s*$", text[match.end():])
-        if not end:
+        path = Path(path)
+        if not path.is_file():
             continue
-        body = text[match.end():match.end() + end.start()]
-        size = size_re.search(body)
-        if size:
-            sites[name] = (float(size.group(1)), float(size.group(2)))
+
+        text = read_text(path)
+
+        for kind, target in (("MACRO", macros), ("SITE", sites)):
+            for match in re.finditer(
+                rf"(?mi)^\s*{kind}\s+(\S+)\s*$", text
+            ):
+                name = match.group(1)
+                end = re.search(
+                    rf"(?mi)^\s*END\s+{re.escape(name)}\s*$",
+                    text[match.end():],
+                )
+                if not end:
+                    continue
+
+                body = text[
+                    match.end():match.end() + end.start()
+                ]
+                size = size_re.search(body)
+                if size:
+                    target[name] = (
+                        float(size.group(1)),
+                        float(size.group(2)),
+                    )
+
     return macros, sites
+
 
 
 def measure_density_from_def(def_text: str, lef_path: Path | None) -> dict[str, Any]:
@@ -206,7 +227,13 @@ def measure_density_from_def(def_text: str, lef_path: Path | None) -> dict[str, 
     This is an achieved-density estimate, not the requested global-placement target.
     It is only returned when both areas can be reconstructed from the files.
     """
-    macros, sites = load_lef_sizes(lef_path)
+    tech_lef_path = configured_path("TECH_LEF")
+    cell_lef_path = lef_path or configured_path("CELL_LEF")
+
+    macros, sites = load_lef_sizes([
+        tech_lef_path,
+        cell_lef_path,
+    ])
     if not def_text or not macros or not sites:
         return {"effective_place_density": None, "placed_cell_area_from_def_um2": None,
                 "placement_row_area_um2": None, "effective_place_density_method": "unavailable: DEF/LEF geometry incomplete"}
@@ -294,6 +321,9 @@ def extract_netlist_features(path: Path, requested_top: str, design_id: str) -> 
         if resolved:
             cells_with_any_directions += 1
         complete = True
+
+        # A cell with no connections contributes no unresolved pin directions.
+        # For connected cells, every pin direction must be known.
         for port_name, bits in connections.items():
             direction = str(resolved.get(port_name, "")).lower()
             port_count_total += 1
@@ -306,7 +336,7 @@ def extract_netlist_features(path: Path, requested_top: str, design_id: str) -> 
                     all_bits.add(bit)
                     if direction == "input":
                         sink_counts[bit] += 1
-        if complete and connections:
+        if complete:
             cells_with_complete_directions += 1
 
     coverage = port_count_known / port_count_total if port_count_total else 0.0
@@ -367,8 +397,50 @@ def timing_patterns() -> dict[str, list[str]]:
     }
 
 
-def parse_timing(text: str, metric: str) -> float | None:
-    return last_number(text, timing_patterns()[metric])
+
+def parse_timing_metric(text: str, metric: str) -> float | None:
+    """Extract a specifically identified timing metric.
+
+    Generic 'worst slack' values are deliberately not accepted here because
+    they may refer to setup or hold timing depending on the report.
+    """
+    if not text:
+        return None
+
+    number = NUM
+    patterns = {
+        "wns_setup_ns": [
+            rf"\bworst\s+slack\s+max\s*[:=]?\s*({number})",
+            rf"\bwns\s+max\s*[:=]?\s*({number})",
+            rf"\bsetup\s+(?:wns|worst\s+slack)\s*[:=]\s*({number})",
+            rf"\b(?:setup\s+)?worst\s+slack\s*\(\s*max\s*\)\s*[:=]\s*({number})",
+        ],
+        "tns_setup_ns": [
+            rf"\btotal\s+negative\s+slack\s+(?:max\s*)?[:=]\s*({number})",
+            rf"\btns\s+max\s*[:=]?\s*({number})",
+            rf"\bsetup\s+tns\s*[:=]\s*({number})",
+        ],
+        "wns_hold_ns": [
+            rf"\bworst\s+slack\s+min\s*[:=]?\s*({number})",
+            rf"\bwns\s+min\s*[:=]?\s*({number})",
+            rf"\bhold\s+(?:wns|worst\s+slack)\s*[:=]\s*({number})",
+            rf"\b(?:hold\s+)?worst\s+slack\s*\(\s*min\s*\)\s*[:=]\s*({number})",
+        ],
+    }
+
+    if metric not in patterns:
+        raise ValueError(f"Unsupported timing metric: {metric}")
+
+    # Search from the end because reports/logs may contain multiple snapshots.
+    for pattern in patterns[metric]:
+        matches = list(re.finditer(pattern, text, re.I | re.M))
+        for match in reversed(matches):
+            value = finite_float(match.group(1))
+            if value is not None:
+                return value
+
+    return None
+
 
 
 def parse_def_routing(text: str) -> dict[str, Any]:
@@ -389,26 +461,52 @@ def parse_route_log(text: str) -> dict[str, Any]:
     return {"wirelength_um": wire, "via_count": int(vias) if vias is not None else None, "final_detailed_route_violations": int(viol) if viol is not None else None}
 
 
+
 def parse_congestion(text: str) -> float | None:
-    """Parse explicit overflow metrics; never infer zero from missing data."""
+    """Extract an explicitly reported congestion-overflow value.
+
+    Returns None when no recognized numeric metric is available.
+    Does not infer zero from an empty or unrecognized report.
+    """
+    if not text or not text.strip():
+        return None
+
     patterns = [
-        rf"(?im)^\s*total\s+(?:routing\s+)?overflow\s*(?:[:=]|is|of)\s*({NUM})\b",
-        rf"(?im)^\s*(?:global\s+)?routing\s+overflow\s*(?:[:=]|is|of)\s*({NUM})\b",
-        rf"(?im)^\s*congestion\s+overflow\s*(?:[:=]|is|of)\s*({NUM})\b",
-        rf"(?im)^\s*overflow\s*(?:[:=]|is|of)\s*({NUM})\b",
+        # Examples: Total overflow: 0; Total overflow = 12
+        rf"(?im)^\s*total\s+(?:routing\s+)?overflow\s*[:=]\s*({NUM})\b",
+
+        # Examples: Routing overflow: 5; Global routing overflow = 3
+        rf"(?im)^\s*(?:(?:global|detailed)\s+)?routing\s+overflow\s*[:=]\s*({NUM})\b",
+
+        # Examples: Congestion overflow: 2
+        rf"(?im)^\s*congestion\s+overflow\s*[:=]\s*({NUM})\b",
+
+        # Explicitly labelled overflow values in log messages
         rf"(?im)^.*?\btotal\s+overflow\s+(?:is|of)\s+({NUM})\b",
+        rf"(?im)^.*?\b(?:global\s+)?routing\s+overflow\s+(?:is|of)\s+({NUM})\b",
+        rf"(?im)^.*?\bcongestion\s+overflow\s+(?:is|of)\s+({NUM})\b",
     ]
+
     value = last_number(text, patterns)
     if value is not None:
         return value
-    if re.search(
-        r"\b(?:no\s+overflowing\s+gcells?|zero\s+routing\s+overflow|total\s+overflow\s*(?:[:=]|is|of)\s*0(?:\.0*)?\b)",
-        text,
-        re.I,
+
+    # Accept zero only when the report explicitly states that no
+    # overflow occurred or explicitly reports a zero total.
+    explicit_zero_patterns = [
+        r"\bno\s+overflowing\s+gcells?\b",
+        r"\bzero\s+routing\s+overflow\b",
+        r"\btotal\s+overflow\s*[:=]\s*0(?:\.0*)?(?![\d.eE])",
+        r"\btotal\s+overflow\s+(?:is|of)\s+0(?:\.0*)?(?![\d.eE])",
+    ]
+
+    if any(
+        re.search(pattern, text, re.I)
+        for pattern in explicit_zero_patterns
     ):
         return 0.0
-    return None
 
+    return None
 
 def parse_physical_log_values(text: str) -> dict[str, Any]:
     density = last_number(text, [
@@ -424,14 +522,44 @@ def parse_physical_log_values(text: str) -> dict[str, Any]:
     return {"effective_place_density": density, "design_area_um2": area}
 
 
-def find_report(run_dir: Path, candidates: list[str]) -> tuple[Path | None, str]:
+
+def find_report(
+    run_dir: Path,
+    candidates: list[str],
+    metric: str | None = None,
+) -> tuple[Path | None, str]:
+    """Find a nonempty report, preferring one with a parseable metric."""
+    seen: set[Path] = set()
+    fallback: tuple[Path | None, str] = (None, "")
+
     for candidate in candidates:
-        paths = [run_dir / candidate] + sorted(run_dir.rglob(candidate))
+        paths = [run_dir / candidate]
+        paths.extend(sorted(run_dir.rglob(candidate)))
+
         for path in paths:
-            if path.is_file():
-                content = read_text(path)
-                if content.strip(): return path, content
-    return None, ""
+            if path in seen:
+                continue
+            seen.add(path)
+
+            if not path.is_file():
+                continue
+
+            content = read_text(path)
+            if not content.strip():
+                continue
+
+            if fallback[0] is None:
+                fallback = (path, content)
+
+            if metric is None:
+                return path, content
+
+            if parse_timing_metric(content, metric) is not None:
+                return path, content
+
+    return fallback
+
+
 
 
 def physical_features(run_dir: Path) -> dict[str, Any]:
@@ -442,34 +570,113 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
     odb_path = run_dir / "final.odb"
     def_text = read_text(def_path)
 
-    setup_path, setup_text = find_report(run_dir, [
-        "wns_setup.rpt", "wns_setup_global_route.rpt", "timing_setup.rpt",
-        "timing_setup_global_route.rpt", "setup_timing.rpt", "setup.rpt"
-    ])
-    tns_path, tns_text = find_report(run_dir, [
-        "tns_setup.rpt", "tns_setup_global_route.rpt", "timing_setup.rpt",
-        "timing_setup_global_route.rpt", "setup_timing.rpt", "setup.rpt"
-    ])
-    hold_path, hold_text = find_report(run_dir, [
-        "wns_hold.rpt", "timing_hold.rpt", "wns_hold_global_route.rpt",
-        "hold_timing.rpt", "hold.rpt"
-    ])
-    cong_path, cong_text = find_report(run_dir, [
-        "congestion.rpt", "global_route_congestion.rpt", "routing_congestion.rpt", "grt_congestion.rpt"
-    ])
-    area_path, area_text = find_report(run_dir, ["design_area.rpt", "area.rpt"])
+    # Find reports containing the specific timing metric.
+    setup_path, setup_text = find_report(
+        run_dir,
+        [
+            "wns_setup.rpt",
+            "timing_setup.rpt",
+            "wns_setup_global_route.rpt",
+            "timing_setup_global_route.rpt",
+            "setup_timing.rpt",
+            "setup.rpt",
+        ],
+        metric="wns_setup_ns",
+    )
 
+    tns_path, tns_text = find_report(
+        run_dir,
+        [
+            "tns_setup.rpt",
+            "tns_setup_global_route.rpt",
+            "timing_setup.rpt",
+            "timing_setup_global_route.rpt",
+            "setup_timing.rpt",
+            "setup.rpt",
+        ],
+        metric="tns_setup_ns",
+    )
+
+    hold_path, hold_text = find_report(
+        run_dir,
+        [
+            "wns_hold.rpt",
+            "timing_hold.rpt",
+            "wns_hold_global_route.rpt",
+            "hold_timing.rpt",
+            "hold.rpt",
+        ],
+        metric="wns_hold_ns",
+    )
+
+    # Other physical reports.
+    cong_path, cong_text = find_report(
+        run_dir,
+        [
+            "congestion.rpt",
+            "global_route_congestion.rpt",
+            "routing_congestion.rpt",
+            "grt_congestion.rpt",
+        ],
+    )
+
+    area_path, area_text = find_report(
+        run_dir,
+        ["design_area.rpt", "area.rpt"],
+    )
+
+    # Collect logs for fallback measurements.
     logs = collect_logs(run_dir)
     route_name, route_text = choose_routing_log(logs)
     all_logs = "\n".join(logs.values())
 
-    setup_src = setup_text or all_logs
-    tns_src = tns_text or all_logs
-    hold_src = hold_text or all_logs
-    wns_setup = parse_timing(setup_src, "wns_setup_ns")
-    tns_setup = parse_timing(tns_src, "tns_setup_ns")
-    wns_hold = parse_timing(hold_src, "wns_hold_ns")
+    # Parse each timing metric independently.
+    # Do not use one generic timing parser for setup and hold.
+    wns_setup = parse_timing_metric(setup_text, "wns_setup_ns")
+    tns_setup = parse_timing_metric(tns_text, "tns_setup_ns")
+    wns_hold = parse_timing_metric(hold_text, "wns_hold_ns")
+
+    # If a report exists but contains no parseable value, try the logs.
+    if wns_setup is None:
+        wns_setup = parse_timing_metric(all_logs, "wns_setup_ns")
+        if wns_setup is not None:
+            setup_path = None
+
+    if tns_setup is None:
+        tns_setup = parse_timing_metric(all_logs, "tns_setup_ns")
+        if tns_setup is not None:
+            tns_path = None
+
+    if wns_hold is None:
+        wns_hold = parse_timing_metric(all_logs, "wns_hold_ns")
+        if wns_hold is not None:
+            hold_path = None
+
+    # Record the source actually used for each timing measurement.
+    setup_src = (
+        str(setup_path)
+        if setup_path is not None and wns_setup is not None
+        else "logs" if wns_setup is not None
+        else None
+    )
+
+    tns_src = (
+        str(tns_path)
+        if tns_path is not None and tns_setup is not None
+        else "logs" if tns_setup is not None
+        else None
+    )
+
+    hold_src = (
+        str(hold_path)
+        if hold_path is not None and wns_hold is not None
+        else "logs" if wns_hold is not None
+        else None
+    )
+
+    # Extract routing metrics from the selected routing log.
     route = parse_route_log(route_text)
+
 
     # First parse the designated congestion report. If it contains no recognized
     # numeric overflow, fall back to the OpenROAD logs rather than stopping here.
