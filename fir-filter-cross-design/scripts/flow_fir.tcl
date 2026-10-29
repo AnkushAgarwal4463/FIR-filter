@@ -101,25 +101,39 @@ set congestion_report "$::env(RUN_DIR)/congestion.rpt"
 fir_step "global_routing" [list global_route \
     -congestion_report_file $congestion_report -verbose]
 
-# Capture whether global routing reports any remaining congestion.
-if {[catch {has_congestion} congestion_flag]} {
-    fir_log "GLOBAL_ROUTE_HAS_CONGESTION: unavailable ($congestion_flag)"
-} else {
-    fir_log "GLOBAL_ROUTE_HAS_CONGESTION: $congestion_flag"
+# Capture the global-routing congestion status.
+# has_congestion returns 1 if routing overflow remains, otherwise 0.
+set congestion_overflow_report "$::env(RUN_DIR)/congestion_overflow.rpt"
 
+if {[catch {has_congestion} congestion_flag]} {
+    fir_log "GLOBAL_ROUTE_HAS_CONGESTION: unavailable"
+    fir_log "WARNING: Could not query global-routing congestion: $congestion_flag"
+
+    set fd [open $congestion_overflow_report w]
+    puts $fd "GLOBAL_ROUTE_STATUS: unavailable"
+    close $fd
+} else {
+    set congestion_flag [expr {$congestion_flag ? 1 : 0}]
+
+    # Write a marker that the Python extractor can parse.
+    set fd [open $congestion_overflow_report w]
     if {$congestion_flag} {
-        if {[catch {report_congestion} congestion_output]} {
-            fir_log "WARNING: report_congestion failed: $congestion_output"
-        } else {
-            set fd [open "$::env(RUN_DIR)/congestion_overflow.rpt" w]
-            puts $fd $congestion_output
-            close $fd
-        }
+        puts $fd "GLOBAL_ROUTE_HAS_CONGESTION: true"
+        fir_log "GLOBAL_ROUTE_HAS_CONGESTION: true"
     } else {
-        set fd [open "$::env(RUN_DIR)/congestion_overflow.rpt" w]
-        puts $fd "GLOBAL_ROUTE_HAS_CONGESTION: 0"
+        puts $fd "GLOBAL_ROUTE_HAS_CONGESTION: false"
         puts $fd "No remaining global-routing congestion reported."
-        close $fd
+        fir_log "GLOBAL_ROUTE_HAS_CONGESTION: false"
+    }
+    close $fd
+
+    # Append the actual OpenROAD congestion report when available.
+    if {$congestion_flag} {
+        if {[catch {
+            report_congestion >> $congestion_overflow_report
+        } report_error]} {
+            fir_log "WARNING: report_congestion failed: $report_error"
+        }
     }
 }
 
