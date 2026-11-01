@@ -1,11 +1,4 @@
-
-# FIR synthesis template.
-# The runner replaces __LIB_FILE__ with the absolute Liberty path.
-# Outputs are written to fir_project/synth/.
-
-# --------------------------------------------------
-# 1. Read RTL and configure the FIR design
-# --------------------------------------------------
+# FIR synthesis diagnostic script
 
 read_verilog -sv rtl/fir_filter.v
 
@@ -16,54 +9,54 @@ chparam -set DATA_WIDTH 8 \
 
 hierarchy -check -top fir_filter
 
-# --------------------------------------------------
-# 2. Convert RTL to a technology-independent netlist
-# --------------------------------------------------
-
+# Stage 1: RTL process conversion
 proc
-flatten
 opt
+stat
+check
+
+# Stage 2: Structural optimization
+flatten
 fsm
 opt
 memory
 opt
+stat
+check
+
+# Stage 3: Technology-independent mapping
 techmap
 opt
+stat
+check
 
-# --------------------------------------------------
-# 3. Map flip-flops and combinational logic to Sky130HD
-# --------------------------------------------------
-
+# Stage 4: Flip-flop and combinational mapping
 dfflibmap -liberty "__LIB_FILE__"
-abc -liberty "__LIB_FILE__"
+stat
+check
 
+abc -liberty "__LIB_FILE__"
 opt
 clean
+stat
+check
 
-# Map constant logic values to Sky130HD tie cells.
+# Stage 5: Constant mapping
 hilomap -singleton \
     -hicell sky130_fd_sc_hd__conb_1 HI \
     -locell sky130_fd_sc_hd__conb_1 LO
 
 opt
 clean
+stat
+check
 
-# --------------------------------------------------
-# 4. Validate the synthesized design
-# --------------------------------------------------
-
+# Stage 6: Final validation
 check -assert
 
-# --------------------------------------------------
-# 5. Export synthesized netlist and machine-readable JSON
-# --------------------------------------------------
-
+# Stage 7: Export
 write_json fir_project/synth/fir_filter_netlist.json
 write_verilog -noattr -noexpr \
     fir_project/synth/fir_filter_netlist.v
-
-# --------------------------------------------------
-# 6. Report synthesis statistics
-# --------------------------------------------------
 
 stat -liberty "__LIB_FILE__"
