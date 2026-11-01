@@ -27,6 +27,10 @@ abc -liberty "__LIB_FILE__"
 opt
 clean
 
+write_verilog -noattr fir_project/synth/debug_before_check.v
+write_json fir_project/synth/debug_before_check.json
+check
+
 check -assert
 stat
 
