@@ -1,13 +1,7 @@
 # ============================================================
 # FIR Filter - Yosys Synthesis Diagnostic Script
 # Target: Sky130HD
-# DATA_WIDTH  = 8
-# COEFF_WIDTH = 8
-# TAPS        = 8
-# ACC_WIDTH   = 24
 # ============================================================
-
-# 1. Read RTL and configure parameters
 
 read_verilog -sv rtl/fir_filter.v
 
@@ -18,81 +12,24 @@ chparam -set DATA_WIDTH 8 \
 
 hierarchy -check -top fir_filter
 
-
-# 2. RTL process conversion
-
+# Run logic reduction first
 proc
-opt
-stat
-check
-
-
-# 3. Structural optimization
-
-flatten
+opt_expr
+opt_clean
 fsm
 opt
 memory
 opt
-stat
-check
-
-
-# 4. Technology-independent mapping
-
 techmap
 opt
-stat
-check
-
-
-# 5. Flip-flop mapping
-
-dfflibmap -liberty "__LIB_FILE__"
-write_verilog -noattr fir_project/synth/debug_after_dfflibmap.v
-write_json fir_project/synth/debug_after_dfflibmap.json
-
-stat
-check
-
-
-# 6. Combinational logic mapping
-
 abc -liberty "__LIB_FILE__"
-
-write_verilog -noattr fir_project/synth/debug_after_abc.v
-write_json fir_project/synth/debug_after_abc.json
-
-stat
-check
 opt
 clean
 
-# 7. Constant mapping
-
-hilomap -singleton \
-    -hicell sky130_fd_sc_hd__conb_1 HI \
-    -locell sky130_fd_sc_hd__conb_1 LO
-
-opt
-clean
-stat
-check
-
-
-# 8. Final validation
-
+# Final checks
 check -assert
+stat
 
-
-# 9. Export synthesized netlist
-
+# Outputs
+write_verilog -noattr -noexpr fir_project/synth/fir_filter_netlist.v
 write_json fir_project/synth/fir_filter_netlist.json
-
-write_verilog -noattr -noexpr \
-    fir_project/synth/fir_filter_netlist.v
-
-
-# 10. Final statistics
-
-stat -liberty "__LIB_FILE__"
