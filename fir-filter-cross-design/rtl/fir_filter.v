@@ -31,10 +31,10 @@ module fir_filter #(
     endfunction
 
     reg signed [DATA_WIDTH-1:0] delay_line [0:TAPS-1];
-
     wire signed [DATA_WIDTH+COEFF_WIDTH-1:0] products [0:TAPS-1];
-
     reg signed [ACC_WIDTH-1:0] sum_comb;
+    reg signed [ACC_WIDTH-1:0] sample_out_next;
+    reg valid_out_next;
 
     integer i;
     integer k;
@@ -59,6 +59,20 @@ module fir_filter #(
         end
     end
 
+    // Explicit next-state logic ensures each output bit is always assigned.
+    always @* begin
+        valid_out_next = valid_in;
+        sample_out_next = sample_out;
+
+        if (rst) begin
+            valid_out_next = 1'b0;
+            sample_out_next = '0;
+        end else if (valid_in) begin
+            valid_out_next = 1'b1;
+            sample_out_next = sum_comb;
+        end
+    end
+
     // Sequential sample history and registered output.
     always @(posedge clk) begin
         if (rst) begin
@@ -68,18 +82,15 @@ module fir_filter #(
             valid_out  <= 1'b0;
             sample_out <= '0;
         end else begin
-            valid_out <= valid_in;
-
             if (valid_in) begin
                 for (i = TAPS-1; i > 0; i = i - 1)
                     delay_line[i] <= delay_line[i-1];
 
                 delay_line[0] <= sample_in;
-                sample_out    <= sum_comb;
-            end else begin
-                // Keep the last valid output stable when no new input is present.
-                sample_out <= sample_out;
             end
+
+            valid_out  <= valid_out_next;
+            sample_out <= sample_out_next;
         end
     end
 
