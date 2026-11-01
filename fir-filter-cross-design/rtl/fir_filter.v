@@ -1,9 +1,9 @@
 // 8-tap signed FIR filter with registered output and sample history.
 module fir_filter #(
-    parameter integer DATA_WIDTH = 8,
+    parameter integer DATA_WIDTH  = 8,
     parameter integer COEFF_WIDTH = 8,
-    parameter integer TAPS = 8,
-    parameter integer ACC_WIDTH = 24
+    parameter integer TAPS        = 8,
+    parameter integer ACC_WIDTH   = 24
 ) (
     input wire clk,
     input wire rst,
@@ -12,6 +12,7 @@ module fir_filter #(
     output reg valid_out,
     output reg signed [ACC_WIDTH-1:0] sample_out
 );
+
     function signed [COEFF_WIDTH-1:0] coeff;
         input integer idx;
         begin
@@ -30,34 +31,54 @@ module fir_filter #(
     endfunction
 
     reg signed [DATA_WIDTH-1:0] delay_line [0:TAPS-1];
-    integer i;
-    integer k;
-    reg signed [DATA_WIDTH+COEFF_WIDTH-1:0] product;
+
+    wire signed [DATA_WIDTH+COEFF_WIDTH-1:0] products [0:TAPS-1];
+
     reg signed [ACC_WIDTH-1:0] sum_comb;
 
+    integer i;
+    integer k;
+
+    // One signed multiplication per tap.
+    genvar g;
+    generate
+        for (g = 0; g < TAPS; g = g + 1) begin : GEN_PRODUCTS
+            assign products[g] = delay_line[g] * coeff(g);
+        end
+    endgenerate
+
+    // Sign-extend and accumulate all tap products.
     always @* begin
         sum_comb = '0;
-        product = '0;
+
         for (k = 0; k < TAPS; k = k + 1) begin
-            product = delay_line[k] * coeff(k);
-            sum_comb = sum_comb + {{(ACC_WIDTH-(DATA_WIDTH+COEFF_WIDTH)){product[DATA_WIDTH+COEFF_WIDTH-1]}}, product};
+            sum_comb = sum_comb +
+                {{(ACC_WIDTH-(DATA_WIDTH+COEFF_WIDTH))
+                    {products[k][DATA_WIDTH+COEFF_WIDTH-1]}},
+                    products[k]};
         end
     end
 
+    // Sequential sample history and registered output.
     always @(posedge clk) begin
         if (rst) begin
             for (i = 0; i < TAPS; i = i + 1)
                 delay_line[i] <= '0;
+
             sample_out <= '0;
-            valid_out <= 1'b0;
-        end else begin
+            valid_out  <= 1'b0;
+        end
+        else begin
             valid_out <= valid_in;
+
             if (valid_in) begin
                 for (i = TAPS-1; i > 0; i = i - 1)
                     delay_line[i] <= delay_line[i-1];
+
                 delay_line[0] <= sample_in;
-                sample_out <= sum_comb;
+                sample_out    <= sum_comb;
             end
         end
     end
+
 endmodule
