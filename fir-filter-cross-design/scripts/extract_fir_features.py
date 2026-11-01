@@ -74,12 +74,38 @@ def collect_logs(run_dir: Path) -> dict[str, str]:
 
 
 def choose_routing_log(logs: dict[str, str]) -> tuple[str | None, str]:
-    priority = ("5_2_route.log", "detailed_route.log", "openroad_log.txt", "flow_diagnostics.log")
-    for wanted in priority:
-        for name, content in logs.items():
-            if Path(name).name.lower() == wanted and re.search(r"detailed routing|detail routing|total wire length|number of vias|violations", content, re.I):
+    """Choose the most specific detailed-routing log available.
+
+    Do not concatenate unrelated logs for route metrics: that can mix stale
+    runs or intermediate routing snapshots and produce misleading final values.
+    """
+    dedicated = ("5_2_route.log", "detailed_route.log", "route.log")
+    for wanted in dedicated:
+        candidates = [
+            (name, content) for name, content in logs.items()
+            if Path(name).name.lower() == wanted and content.strip()
+        ]
+        if candidates:
+            # If duplicated names exist in nested directories, prefer the
+            # lexically last path; a single run directory should normally have one.
+            name, content = sorted(candidates, key=lambda item: item[0])[-1]
+            return name, content
+
+    # The runner's consolidated log is a fallback only when it contains an
+    # explicit detailed-routing completion marker and route summary fields.
+    for name, content in logs.items():
+        if Path(name).name.lower() == "openroad_log.txt":
+            has_completion = re.search(
+                r"SUCCESS:\s*Detailed routing|Complete detail routing|Detailed routing completed",
+                content, re.I,
+            )
+            has_summary = re.search(
+                r"Total\s+wire\s+length|Total\s+number\s+of\s+vias|Number\s+of\s+violations",
+                content, re.I,
+            )
+            if has_completion and has_summary:
                 return name, content
-    return ("combined_logs", "\n".join(logs.values())) if logs else (None, "")
+    return None, ""
 
 
 def classify_cell(cell_type: str) -> str:
@@ -299,27 +325,6 @@ def extract_netlist_features(path: Path, requested_top: str, design_id: str) -> 
     liberty_path = configured_path("LIBERTY")
     liberty_directions = load_liberty_pin_directions(liberty_path)
     
-    # Temporary diagnostics: verify Liberty parsing and cell-name matching.
-    netlist_cell_types = {
-        str(cell.get("type", "")).lstrip("\\")
-        for cell in cells.values()
-    }
-
-    matched_types = netlist_cell_types & set(liberty_directions)
-
-    print("\n===== Liberty Fanout Diagnostics =====")
-    print(f"LIBERTY path: {liberty_path}")
-    print(
-        "LIBERTY file exists: "
-        f"{liberty_path.is_file() if liberty_path else False}"
-    )
-    print(f"Liberty cells parsed: {len(liberty_directions)}")
-    print(f"Unique netlist cell types: {len(netlist_cell_types)}")
-    print(f"Matching cell types: {len(matched_types)}")
-    print(f"Sample netlist cell types: {sorted(netlist_cell_types)[:10]}")
-    print(f"Sample Liberty cell types: {list(liberty_directions)[:10]}")
-    print("======================================\n")
-
     # Normalize names once so each netlist cell lookup is constant-time.
     liberty_by_name = {
         name.strip().strip('"').lstrip("\\").lower(): pins
@@ -760,9 +765,9 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
     def_counts = parse_def_routing(def_text) if def_text else {
         "def_nets_section_found": False, "routed_net_count": None, "route_segment_count": None
     }
-    route_success = bool(re.search(
+    route_success = bool(route_name and re.search(
         r"SUCCESS:\s*Detailed routing|Complete detail routing|Detailed routing completed",
-        all_logs, re.I
+        route_text, re.I
     ))
     def_ok = def_path.is_file() and def_path.stat().st_size > 0
     odb_ok = odb_path.is_file() and odb_path.stat().st_size > 0
@@ -808,8 +813,11 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "note": (
             "DEF route counts are approximate. Cell classes are heuristic and should be validated against Liberty. "
             "Fanout uses Yosys directions with Liberty fallback. Congestion is extracted from a recognized overflow "
-            "metric; missing overflow is unavailable, not zero. Effective density is measured from placed LEF macro "
-            "area divided by DEF placement-row area when geometry is available. Router violations are not independent signoff DRC."
+            "metric; missing overflow is unavailable, not zero. The Boolean GLOBAL_ROUTE_HAS_CONGESTION status is "
+            "stored separately and is not converted into a numeric overflow. Congestion definitions must be checked "
+            "before comparing this value with another design's congestion metric. Effective density is measured "
+            "from placed LEF macro area divided by DEF placement-row area when geometry is available. Router "
+            "violations are not independent signoff DRC."
         ),
         "target_feature_stage": "post-placement/routing targets; exclude these outcomes from predictors when predicting the same outcomes",
     }
@@ -1000,6 +1008,7 @@ def write_human_report(outdir: Path, pre: dict[str, Any], post: dict[str, Any], 
         "- Routed-net and route-segment counts parsed from DEF are approximate.",
         "- Cell-type classifications are heuristic and should be validated against Liberty metadata.",
         "- Timing and routing results are post-placement/routing targets. Exclude a target from input features when predicting that same target to prevent data leakage.",
+        "- FIR parameters (taps, data width, coefficient width, accumulator width), utilization, and clock period are configuration metadata; do not automatically treat them as design-independent netlist predictors.",
         "- Zero reported detailed-route violations does not by itself prove full signoff DRC cleanliness.", "",
         "## 6. Output files", "",
         "| File | Purpose |", "|---|---|",
@@ -1110,10 +1119,11 @@ def main() -> int:
         write_configuration_csv(outdir, run_dir, args, post)
         write_human_report(outdir, pre, post, args, run_dir)
         xlsx_created = write_excel_workbook(outdir, pre, post, combined, args, run_dir)
-        status = {"design_id": args.design_id, "run_id": args.run_id or run_dir.name, "netlist_json": str(netlist_path), "run_dir": str(run_dir), "output_dir": str(outdir), "fanout_direction_metadata_found": pre["fanout_direction_metadata_found"], "final_def_available": post["final_def_available"], "final_odb_available": post["final_odb_available"], "artifacts_present": post["artifacts_present"], "detailed_route_success_marker_found": post["detailed_route_success_marker_found"], "target_measurement_status": post["target_measurement_status"], "markdown_report_created": True, "excel_workbook_created": xlsx_created}
+        status = {"design_id": args.design_id, "run_id": args.run_id or run_dir.name, "netlist_json": str(netlist_path), "run_dir": str(run_dir), "output_dir": str(outdir), "fanout_direction_metadata_found": pre["fanout_direction_metadata_found"], "final_def_available": post["final_def_available"], "final_odb_available": post["final_odb_available"], "artifacts_present": post["artifacts_present"], "detailed_route_success_marker_found": post["detailed_route_success_marker_found"], "target_measurement_status": post["target_measurement_status"], "routing_log_source": post.get("routing_log_source"), "congestion_report_source": post.get("congestion_report_source"), "markdown_report_created": True, "excel_workbook_created": xlsx_created}
         write_json(outdir / "extraction_status.json", status)
-    except (OSError, ValueError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr); return 1
+    except (OSError, ValueError, TypeError, KeyError, csv.Error, json.JSONDecodeError) as exc:
+        print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     print("\n===== FIR Feature Extraction =====")
     print(f"Run directory : {run_dir}\nOutput directory: {outdir}\nCell count    : {pre['cell_count']}\nSequential    : {pre['sequential_cell_count']}\nCombinational : {pre['combinational_cell_count']}\nFanout method : {pre['fanout_method']}\nFinal DEF     : {post['final_def_available']}\nFinal ODB     : {post['final_odb_available']}\nRouting success marker: {post['detailed_route_success_marker_found']}")
     print("\n===== Physical Targets =====")
