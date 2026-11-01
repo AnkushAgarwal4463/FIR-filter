@@ -49,6 +49,9 @@ check
 # 5. Flip-flop mapping
 
 dfflibmap -liberty "__LIB_FILE__"
+write_verilog -noattr fir_project/synth/debug_after_dfflibmap.v
+write_json fir_project/synth/debug_after_dfflibmap.json
+
 stat
 check
 
@@ -56,11 +59,14 @@ check
 # 6. Combinational logic mapping
 
 abc -liberty "__LIB_FILE__"
-opt
-clean
+
+write_verilog -noattr fir_project/synth/debug_after_abc.v
+write_json fir_project/synth/debug_after_abc.json
+
 stat
 check
-
+opt
+clean
 
 # 7. Constant mapping
 
