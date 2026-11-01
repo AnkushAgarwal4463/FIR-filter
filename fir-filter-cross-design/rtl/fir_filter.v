@@ -1,4 +1,3 @@
-// 8-tap signed FIR filter with registered output and sample history.
 module fir_filter #(
     parameter integer DATA_WIDTH  = 8,
     parameter integer COEFF_WIDTH = 8,
@@ -31,29 +30,32 @@ module fir_filter #(
     endfunction
 
     reg signed [DATA_WIDTH-1:0] delay_line [0:TAPS-1];
-    wire signed [DATA_WIDTH + COEFF_WIDTH - 1:0] products [0:TAPS-1];
+
+    wire signed [DATA_WIDTH + COEFF_WIDTH - 1:0] p0, p1, p2, p3, p4, p5, p6, p7;
+    wire signed [ACC_WIDTH-1:0] s0, s1, s2, s3, s4, s5, s6, s7;
     wire signed [ACC_WIDTH-1:0] sum_comb;
-    wire signed [ACC_WIDTH-1:0] tap_products [0:TAPS-1];
+
     integer i;
-    integer k;
 
-    generate
-        for (genvar g = 0; g < TAPS; g = g + 1) begin : GEN_PRODUCTS
-            assign products[g] = delay_line[g] * coeff(g);
-            assign tap_products[g] = $signed(products[g]);
-        end
-    endgenerate
+    assign p0 = delay_line[0] * coeff(0);
+    assign p1 = delay_line[1] * coeff(1);
+    assign p2 = delay_line[2] * coeff(2);
+    assign p3 = delay_line[3] * coeff(3);
+    assign p4 = delay_line[4] * coeff(4);
+    assign p5 = delay_line[5] * coeff(5);
+    assign p6 = delay_line[6] * coeff(6);
+    assign p7 = delay_line[7] * coeff(7);
 
-    // Explicit flat addition gives Yosys a complete driver set.
-    assign sum_comb =
-        tap_products[0] +
-        tap_products[1] +
-        tap_products[2] +
-        tap_products[3] +
-        tap_products[4] +
-        tap_products[5] +
-        tap_products[6] +
-        tap_products[7];
+    assign s0 = $signed(p0);
+    assign s1 = $signed(p1);
+    assign s2 = $signed(p2);
+    assign s3 = $signed(p3);
+    assign s4 = $signed(p4);
+    assign s5 = $signed(p5);
+    assign s6 = $signed(p6);
+    assign s7 = $signed(p7);
+
+    assign sum_comb = s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7;
 
     always @(posedge clk) begin
         if (rst) begin
