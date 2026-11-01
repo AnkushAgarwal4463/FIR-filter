@@ -30,29 +30,37 @@ module fir_filter #(
         end
     endfunction
 
-    // This implementation supports exactly eight taps.
+    // This implementation is designed for exactly eight taps.
     reg signed [DATA_WIDTH-1:0] delay_line [0:7];
 
     wire signed [DATA_WIDTH+COEFF_WIDTH-1:0] product [0:7];
+
     wire signed [ACC_WIDTH-1:0] extended_product [0:7];
 
-    wire signed [ACC_WIDTH-1:0] sum_comb;
-
     integer i;
-
     genvar g;
+
+    // Generate eight signed multiplication results.
     generate
         for (g = 0; g < 8; g = g + 1) begin : GEN_PRODUCTS
+
             assign product[g] =
                 delay_line[g] * coeff(g);
 
-            assign extended_product[g] =
-                {{(ACC_WIDTH-(DATA_WIDTH+COEFF_WIDTH)){product[g][DATA_WIDTH+COEFF_WIDTH-1]}},
-                 product[g]};
+            assign extended_product[g] = {
+                {(ACC_WIDTH-(DATA_WIDTH+COEFF_WIDTH)){
+                    product[g][DATA_WIDTH+COEFF_WIDTH-1]
+                }},
+                product[g]
+            };
+
         end
     endgenerate
 
-    assign sum_comb =
+    // Direct accumulator expression.
+    wire signed [ACC_WIDTH-1:0] accumulator;
+
+    assign accumulator =
         extended_product[0] +
         extended_product[1] +
         extended_product[2] +
@@ -62,23 +70,30 @@ module fir_filter #(
         extended_product[6] +
         extended_product[7];
 
+    // Sequential FIR operation.
     always @(posedge clk) begin
         if (rst) begin
+
             for (i = 0; i < 8; i = i + 1)
                 delay_line[i] <= '0;
 
             valid_out  <= 1'b0;
             sample_out <= '0;
+
         end else begin
+
+            valid_out <= valid_in;
+
             if (valid_in) begin
+
                 for (i = 7; i > 0; i = i - 1)
                     delay_line[i] <= delay_line[i-1];
 
                 delay_line[0] <= sample_in;
-                sample_out <= sum_comb;
-            end
 
-            valid_out <= valid_in;
+                sample_out <= accumulator;
+
+            end
         end
     end
 
