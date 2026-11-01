@@ -1,5 +1,11 @@
 
-# FIR synthesis template. The runner replaces __LIB_FILE__ and output paths.
+# FIR synthesis template.
+# The runner replaces __LIB_FILE__ with the absolute Liberty path.
+# Outputs are written to fir_project/synth/.
+
+# --------------------------------------------------
+# 1. Read RTL and configure the FIR design
+# --------------------------------------------------
 
 read_verilog -sv rtl/fir_filter.v
 
@@ -10,6 +16,10 @@ chparam -set DATA_WIDTH 8 \
 
 hierarchy -check -top fir_filter
 
+# --------------------------------------------------
+# 2. Convert RTL to a technology-independent netlist
+# --------------------------------------------------
+
 proc
 flatten
 opt
@@ -19,6 +29,10 @@ memory
 opt
 techmap
 opt
+
+# --------------------------------------------------
+# 3. Map flip-flops and combinational logic to Sky130HD
+# --------------------------------------------------
 
 dfflibmap -liberty "__LIB_FILE__"
 abc -liberty "__LIB_FILE__"
@@ -33,11 +47,23 @@ hilomap -singleton \
 
 opt
 clean
-check
 
-# Write synthesized netlist and JSON.
+# --------------------------------------------------
+# 4. Validate the synthesized design
+# --------------------------------------------------
+
+check -assert
+
+# --------------------------------------------------
+# 5. Export synthesized netlist and machine-readable JSON
+# --------------------------------------------------
+
 write_json fir_project/synth/fir_filter_netlist.json
-write_verilog -noattr -noexpr fir_project/synth/fir_filter_netlist.v
+write_verilog -noattr -noexpr \
+    fir_project/synth/fir_filter_netlist.v
 
-# Report synthesis statistics.
+# --------------------------------------------------
+# 6. Report synthesis statistics
+# --------------------------------------------------
+
 stat -liberty "__LIB_FILE__"
