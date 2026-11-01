@@ -9,33 +9,18 @@ chparam -set DATA_WIDTH 8 \
 hierarchy -check -top fir_filter
 
 proc
+
+stat
+check
+
+write_verilog -noattr \
+    fir_project/synth/debug_after_proc.v
+
 opt_expr
 opt_clean
-check
 
-fsm
-opt
-memory
-opt
-techmap
-opt
-
-check
-
-abc -liberty "__LIB_FILE__"
-
-opt
-clean
-
-write_verilog -noattr fir_project/synth/debug_before_check.v
-write_json fir_project/synth/debug_before_check.json
-check
-
-check -assert
 stat
+check
 
-write_verilog -noattr -noexpr \
-    fir_project/synth/fir_filter_netlist.v
-
-write_json \
-    fir_project/synth/fir_filter_netlist.json
+write_verilog -noattr \
+    fir_project/synth/debug_after_opt.v
