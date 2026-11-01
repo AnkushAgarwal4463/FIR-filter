@@ -1,18 +1,6 @@
-# ============================================================
-# FIR Filter - Yosys Synthesis Diagnostic Script
-# Target: Sky130HD
-# ============================================================
-
 read_verilog -sv rtl/fir_filter.v
-
-chparam -set DATA_WIDTH 8 \
-        -set COEFF_WIDTH 8 \
-        -set TAPS 8 \
-        -set ACC_WIDTH 24 fir_filter
-
+chparam -set DATA_WIDTH 8 -set COEFF_WIDTH 8 -set TAPS 8 -set ACC_WIDTH 24 fir_filter
 hierarchy -check -top fir_filter
-
-# Run logic reduction first
 proc
 opt_expr
 opt_clean
@@ -25,11 +13,7 @@ opt
 abc -liberty "__LIB_FILE__"
 opt
 clean
-
-# Final checks
 check -assert
 stat
-
-# Outputs
 write_verilog -noattr -noexpr fir_project/synth/fir_filter_netlist.v
 write_json fir_project/synth/fir_filter_netlist.json
