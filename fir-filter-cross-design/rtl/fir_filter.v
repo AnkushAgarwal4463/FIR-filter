@@ -31,26 +31,19 @@ module fir_filter #(
     endfunction
 
     reg signed [DATA_WIDTH-1:0] delay_line [0:TAPS-1];
-    wire signed [DATA_WIDTH + COEFF_WIDTH - 1:0] products [0:TAPS-1];
-    reg signed [ACC_WIDTH-1:0] acc_sum;
+    reg signed [ACC_WIDTH-1:0] sum_comb;
     integer i;
     integer k;
 
-    generate
-        for (genvar g = 0; g < TAPS; g = g + 1) begin : GEN_PRODUCTS
-            assign products[g] = delay_line[g] * coeff(g);
-        end
-    endgenerate
-
-    // Accumulate all tap products with explicit sign extension.
+    // This is the clean accumulator logic that Yosys can resolve.
     always @* begin
-        acc_sum = '0;
+        sum_comb = '0;
+
         for (k = 0; k < TAPS; k = k + 1) begin
-            acc_sum = acc_sum + $signed(products[k]);
+            sum_comb = sum_comb + (delay_line[k] * coeff(k));
         end
     end
 
-    // Sequential sample history and registered output.
     always @(posedge clk) begin
         if (rst) begin
             for (i = 0; i < TAPS; i = i + 1)
@@ -66,10 +59,8 @@ module fir_filter #(
                 delay_line[0] <= sample_in;
             end
 
-            // Keep output valid in sync with input and drive sample_out
-            // for every branch so Yosys does not see an undriven bus.
             valid_out <= valid_in;
-            sample_out <= valid_in ? acc_sum : sample_out;
+            sample_out <= valid_in ? sum_comb : sample_out;
         end
     end
 
