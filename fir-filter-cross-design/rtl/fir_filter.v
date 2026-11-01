@@ -65,10 +65,9 @@ module fir_filter #(
             for (i = 0; i < TAPS; i = i + 1)
                 delay_line[i] <= '0;
 
-            sample_out <= '0;
             valid_out  <= 1'b0;
-        end
-        else begin
+            sample_out <= '0;
+        end else begin
             valid_out <= valid_in;
 
             if (valid_in) begin
@@ -77,6 +76,9 @@ module fir_filter #(
 
                 delay_line[0] <= sample_in;
                 sample_out    <= sum_comb;
+            end else begin
+                // Keep the last valid output stable when no new input is present.
+                sample_out <= sample_out;
             end
         end
     end
