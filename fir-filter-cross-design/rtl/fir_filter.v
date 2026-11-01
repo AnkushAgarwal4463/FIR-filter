@@ -31,18 +31,29 @@ module fir_filter #(
     endfunction
 
     reg signed [DATA_WIDTH-1:0] delay_line [0:TAPS-1];
-    reg signed [ACC_WIDTH-1:0] sum_comb;
+    wire signed [DATA_WIDTH + COEFF_WIDTH - 1:0] products [0:TAPS-1];
+    wire signed [ACC_WIDTH-1:0] sum_comb;
+    wire signed [ACC_WIDTH-1:0] tap_products [0:TAPS-1];
     integer i;
     integer k;
 
-    // This is the clean accumulator logic that Yosys can resolve.
-    always @* begin
-        sum_comb = '0;
-
-        for (k = 0; k < TAPS; k = k + 1) begin
-            sum_comb = sum_comb + (delay_line[k] * coeff(k));
+    generate
+        for (genvar g = 0; g < TAPS; g = g + 1) begin : GEN_PRODUCTS
+            assign products[g] = delay_line[g] * coeff(g);
+            assign tap_products[g] = $signed(products[g]);
         end
-    end
+    endgenerate
+
+    // Explicit flat addition gives Yosys a complete driver set.
+    assign sum_comb =
+        tap_products[0] +
+        tap_products[1] +
+        tap_products[2] +
+        tap_products[3] +
+        tap_products[4] +
+        tap_products[5] +
+        tap_products[6] +
+        tap_products[7];
 
     always @(posedge clk) begin
         if (rst) begin
