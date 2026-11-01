@@ -1,191 +1,104 @@
-
-name: FIR Synthesis Diagnostic
+name: FIR Synthesis and Physical Design
 
 on:
-  workflow_dispatch:
-
   push:
     paths:
-      - "fir-filter-cross-design/rtl/**"
-      - "fir-filter-cross-design/scripts/synth_fir.ys"
+      - "fir-filter-cross-design/**"
       - ".github/workflows/fir-physical-design.yml"
-      - "environment.yml"
 
   pull_request:
     paths:
-      - "fir-filter-cross-design/rtl/**"
-      - "fir-filter-cross-design/scripts/synth_fir.ys"
+      - "fir-filter-cross-design/**"
       - ".github/workflows/fir-physical-design.yml"
-      - "environment.yml"
 
-permissions:
-  contents: read
-
-concurrency:
-  group: fir-diagnostic-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  workflow_dispatch:
 
 jobs:
-  fir-synthesis-diagnostic:
+  fir-physical-design:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    container:
-      image: openroad/orfs:latest
-
     defaults:
       run:
         working-directory: fir-filter-cross-design
-        shell: bash -el {0}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Verify project files
-        run: |
-          set -euo pipefail
-
-          echo "Project directory: $PWD"
-
-          test -f rtl/fir_filter.v
-          test -f scripts/synth_fir.ys
-          test -f ../environment.yml
-
-          echo "===== RTL FILE ====="
-          sed -n '1,240p' rtl/fir_filter.v
-
-          echo "===== SYNTHESIS SCRIPT ====="
-          sed -n '1,200p' scripts/synth_fir.ys
-
-      - name: Set up Python and synthesis tools
+      - name: Set up Micromamba
         uses: mamba-org/setup-micromamba@v2
         with:
-          environment-file: ${{ github.workspace }}/environment.yml
+          environment-file: fir-filter-cross-design/environment.yml
           environment-name: fir-pd-flow
           cache-environment: true
-          init-shell: bash
-          post-cleanup: none
 
-      - name: Verify Yosys
+      - name: Verify installed tools
+        shell: bash -el {0}
         run: |
-          set -euo pipefail
-
-          command -v yosys
           yosys -V
+          openroad -version
+          iverilog -V
+          python3 --version
 
-          mkdir -p fir_project/synth
-
-      - name: Diagnose FIR synthesis
-        id: diagnostic
-        continue-on-error: true
+      - name: Verify Sky130 PDK files
+        shell: bash -el {0}
         run: |
-          set -uo pipefail
+          source config/sky130_example.env
 
-          mkdir -p fir_project/synth
+          for file in "$LIBERTY" "$TECH_LEF" "$CELL_LEF"; do
+            if [[ ! -f "$file" ]]; then
+              echo "ERROR: PDK file not found: $file"
+              exit 1
+            fi
+            echo "Found: $file"
+          done
 
-          echo "===== SYNTHESIS DIAGNOSTIC ====="
+      - name: Run FIR RTL simulation
+        shell: bash -el {0}
+        run: |
+          make sim
 
-          yosys -l fir_project/synth/diagnostic.log -p '
+      - name: Check FIR RTL with Yosys
+        shell: bash -el {0}
+        run: |
+          yosys -p "
             read_verilog -sv rtl/fir_filter.v
-
-            chparam -set DATA_WIDTH 8 \
-                    -set COEFF_WIDTH 8 \
-                    -set TAPS 8 \
-                    -set ACC_WIDTH 24 fir_filter
-
             hierarchy -check -top fir_filter
-
-            echo
-            echo === CHECK AFTER HIERARCHY ===
-            check
-
             proc
-
-            echo
-            echo === CHECK AFTER PROC ===
-            stat
-            check
-
-            write_verilog -noattr \
-              fir_project/synth/debug_after_proc.v
-
-            write_json \
-              fir_project/synth/debug_after_proc.json
-
-            opt_expr
-            opt_clean
-
-            echo
-            echo === CHECK AFTER OPT_EXPR AND OPT_CLEAN ===
-            stat
-            check
-
-            write_verilog -noattr \
-              fir_project/synth/debug_after_opt.v
-
-            write_json \
-              fir_project/synth/debug_after_opt.json
-
             opt
-
-            echo
-            echo === CHECK AFTER OPT ===
-            stat
             check
+          "
 
-            write_verilog -noattr \
-              fir_project/synth/debug_after_opt_full.v
-
-            write_json \
-              fir_project/synth/debug_after_opt_full.json
-
-            check -assert
-          '
-
-          YOSYS_STATUS=$?
-
-          echo "Yosys exit code: $YOSYS_STATUS"
-
-          echo "===== GENERATED DEBUG FILES ====="
-          find fir_project/synth -maxdepth 1 -type f -print | sort
-
-          exit "$YOSYS_STATUS"
-
-      - name: Display diagnostic log
-        if: always()
+      - name: Run FIR synthesis and physical design
+        shell: bash -el {0}
         run: |
-          set -uo pipefail
+          chmod +x scripts/run_fir_flow.sh
+          ./scripts/run_fir_flow.sh
 
-          LOG="fir_project/synth/diagnostic.log"
+      - name: Verify generated outputs
+        if: success()
+        shell: bash -el {0}
+        run: |
+          echo "Checking synthesis outputs..."
+          test -s fir_project/synth/fir_filter_netlist.v
+          test -s fir_project/synth/fir_filter_netlist.json
 
-          if [[ -f "$LOG" ]]; then
-            echo "===== CHECK RESULTS ====="
+          echo "Checking physical-design outputs..."
+          test -s fir_project/runs/fir_8tap_w8_util40_clk10/final.def
+          test -s fir_project/runs/fir_8tap_w8_util40_clk10/final.odb
 
-            grep -n -A 35 -B 5 -E \
-              'CHECK AFTER|Checking module|no driver|problems|ERROR:' \
-              "$LOG" || true
+          echo "Checking feature outputs..."
+          test -s fir_project/runs/fir_8tap_w8_util40_clk10/features.csv
+          test -s fir_project/runs/fir_8tap_w8_util40_clk10/features.json
 
-            echo "===== LOG END ====="
-            tail -n 100 "$LOG"
-          else
-            echo "Diagnostic log was not generated."
-          fi
+          echo "All required outputs are present."
 
-      - name: Upload diagnostic artifacts
+      - name: Upload FIR flow artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fir-yosys-diagnostic-${{ github.run_number }}
+          name: fir-physical-design-results
+          path: |
+            fir-filter-cross-design/fir_project/synth/
+            fir-filter-cross-design/fir_project/runs/
           if-no-files-found: warn
           retention-days: 14
-          path: |
-            fir-filter-cross-design/fir_project/synth/diagnostic.log
-            fir-filter-cross-design/fir_project/synth/debug_after_proc.v
-            fir-filter-cross-design/fir_project/synth/debug_after_proc.json
-            fir-filter-cross-design/fir_project/synth/debug_after_opt.v
-            fir-filter-cross-design/fir_project/synth/debug_after_opt.json
-            fir-filter-cross-design/fir_project/synth/debug_after_opt_full.v
-            fir-filter-cross-design/fir_project/synth/debug_after_opt_full.json
-            fir-filter-cross-design/rtl/fir_filter.v
-            fir-filter-cross-design/scripts/synth_fir.ys
