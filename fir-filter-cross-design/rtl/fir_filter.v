@@ -13,17 +13,17 @@ module fir_filter #(
     output reg signed [ACC_WIDTH-1:0] sample_out
 );
 
-    function signed [COEFF_WIDTH-1:0] coeff;
+    function automatic signed [COEFF_WIDTH-1:0] coeff;
         input integer idx;
         begin
             case (idx)
-                0: coeff =  8'sd3;
+                0: coeff = 8'sd3;
                 1: coeff = -8'sd2;
-                2: coeff =  8'sd5;
-                3: coeff =  8'sd1;
+                2: coeff = 8'sd5;
+                3: coeff = 8'sd1;
                 4: coeff = -8'sd4;
-                5: coeff =  8'sd6;
-                6: coeff =  8'sd2;
+                5: coeff = 8'sd6;
+                6: coeff = 8'sd2;
                 7: coeff = -8'sd1;
                 default: coeff = '0;
             endcase
@@ -31,45 +31,22 @@ module fir_filter #(
     endfunction
 
     reg signed [DATA_WIDTH-1:0] delay_line [0:TAPS-1];
-    wire signed [DATA_WIDTH+COEFF_WIDTH-1:0] products [0:TAPS-1];
-    reg signed [ACC_WIDTH-1:0] sum_comb;
-    reg signed [ACC_WIDTH-1:0] sample_out_next;
-    reg valid_out_next;
-
+    wire signed [DATA_WIDTH + COEFF_WIDTH - 1:0] products [0:TAPS-1];
+    reg signed [ACC_WIDTH-1:0] acc_sum;
     integer i;
     integer k;
 
-    // One signed multiplication per tap.
-    genvar g;
     generate
-        for (g = 0; g < TAPS; g = g + 1) begin : GEN_PRODUCTS
+        for (genvar g = 0; g < TAPS; g = g + 1) begin : GEN_PRODUCTS
             assign products[g] = delay_line[g] * coeff(g);
         end
     endgenerate
 
-    // Sign-extend and accumulate all tap products.
+    // Accumulate all tap products with explicit sign extension.
     always @* begin
-        sum_comb = '0;
-
+        acc_sum = '0;
         for (k = 0; k < TAPS; k = k + 1) begin
-            sum_comb = sum_comb +
-                {{(ACC_WIDTH-(DATA_WIDTH+COEFF_WIDTH))
-                    {products[k][DATA_WIDTH+COEFF_WIDTH-1]}},
-                    products[k]};
-        end
-    end
-
-    // Explicit next-state logic ensures each output bit is always assigned.
-    always @* begin
-        valid_out_next = valid_in;
-        sample_out_next = sample_out;
-
-        if (rst) begin
-            valid_out_next = 1'b0;
-            sample_out_next = '0;
-        end else if (valid_in) begin
-            valid_out_next = 1'b1;
-            sample_out_next = sum_comb;
+            acc_sum = acc_sum + $signed(products[k]);
         end
     end
 
@@ -89,8 +66,10 @@ module fir_filter #(
                 delay_line[0] <= sample_in;
             end
 
-            valid_out  <= valid_out_next;
-            sample_out <= sample_out_next;
+            // Keep output valid in sync with input and drive sample_out
+            // for every branch so Yosys does not see an undriven bus.
+            valid_out <= valid_in;
+            sample_out <= valid_in ? acc_sum : sample_out;
         end
     end
 
