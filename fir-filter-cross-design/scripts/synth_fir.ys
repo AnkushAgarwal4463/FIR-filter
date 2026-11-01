@@ -1,19 +1,37 @@
+
 read_verilog -sv rtl/fir_filter.v
-chparam -set DATA_WIDTH 8 -set COEFF_WIDTH 8 -set TAPS 8 -set ACC_WIDTH 24 fir_filter
+
+chparam -set DATA_WIDTH 8 \
+        -set COEFF_WIDTH 8 \
+        -set TAPS 8 \
+        -set ACC_WIDTH 24 fir_filter
+
 hierarchy -check -top fir_filter
+
 proc
 opt_expr
 opt_clean
+check
+
 fsm
 opt
 memory
 opt
 techmap
 opt
+
+check
+
 abc -liberty "__LIB_FILE__"
+
 opt
 clean
+
 check -assert
 stat
-write_verilog -noattr -noexpr fir_project/synth/fir_filter_netlist.v
-write_json fir_project/synth/fir_filter_netlist.json
+
+write_verilog -noattr -noexpr \
+    fir_project/synth/fir_filter_netlist.v
+
+write_json \
+    fir_project/synth/fir_filter_netlist.json
