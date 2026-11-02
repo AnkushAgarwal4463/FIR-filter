@@ -97,45 +97,41 @@ if {[catch {repair_timing -setup -setup_margin 0.2} result]} {
 
 # Global route and explicit congestion measurement.
 set congestion_report "$::env(RUN_DIR)/congestion.rpt"
+set congestion_overflow_report "$::env(RUN_DIR)/congestion_overflow.rpt"
 
 fir_step "global_routing" [list global_route \
     -congestion_report_file $congestion_report -verbose]
 
-# Capture the global-routing congestion status.
-# has_congestion returns 1 if routing overflow remains, otherwise 0.
-set congestion_overflow_report "$::env(RUN_DIR)/congestion_overflow.rpt"
-
+# Record Boolean congestion status separately from numeric overflow.
 if {[catch {has_congestion} congestion_flag]} {
+    set congestion_status "unavailable"
     fir_log "GLOBAL_ROUTE_HAS_CONGESTION: unavailable"
     fir_log "WARNING: Could not query global-routing congestion: $congestion_flag"
-
-    set fd [open $congestion_overflow_report w]
-    puts $fd "GLOBAL_ROUTE_STATUS: unavailable"
-    close $fd
 } else {
     set congestion_flag [expr {$congestion_flag ? 1 : 0}]
-
-    # Write a marker that the Python extractor can parse.
-    set fd [open $congestion_overflow_report w]
     if {$congestion_flag} {
-        puts $fd "GLOBAL_ROUTE_HAS_CONGESTION: true"
-        fir_log "GLOBAL_ROUTE_HAS_CONGESTION: true"
+        set congestion_status "true"
     } else {
-        puts $fd "GLOBAL_ROUTE_HAS_CONGESTION: false"
-        puts $fd "No remaining global-routing congestion reported."
-        fir_log "GLOBAL_ROUTE_HAS_CONGESTION: false"
+        set congestion_status "false"
     }
-    close $fd
-
-    # Append the actual OpenROAD congestion report when available.
-    if {$congestion_flag} {
-        if {[catch {
-            report_congestion >> $congestion_overflow_report
-        } report_error]} {
-            fir_log "WARNING: report_congestion failed: $report_error"
-        }
-    }
+    fir_log "GLOBAL_ROUTE_HAS_CONGESTION: $congestion_status"
 }
+
+# Always attempt to generate the detailed congestion report.
+set report_generated 0
+
+if {[catch {report_congestion} report_result]} {
+    fir_log "WARNING: report_congestion failed: $report_result"
+} else {
+    set report_generated 1
+    fir_log "CONGESTION_REPORT_GENERATED"
+}
+
+# Save status and report-generation information.
+set fd [open $congestion_overflow_report w]
+puts $fd "GLOBAL_ROUTE_HAS_CONGESTION: $congestion_status"
+puts $fd "CONGESTION_REPORT_GENERATED: $report_generated"
+close $fd
 
 fir_step "estimate_global_route_parasitics" [list estimate_parasitics -global_routing]
 catch {report_checks -path_delay max -format full_clock_expanded > "$::env(RUN_DIR)/timing_setup_global_route.rpt"}
