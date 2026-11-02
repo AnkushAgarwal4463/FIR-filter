@@ -94,6 +94,9 @@ if {[catch {repair_timing -setup -setup_margin 0.2} result]} {
     fir_log "OPTIONAL_STEP_COMPLETED: repair_timing"
 }
 
+# repair_timing may resize or clone instances after legalization. Legalize
+# those changes before routing so new/modified cells have legal placements.
+fir_step "detailed_placement_after_timing_repair" [list detailed_placement]
 
 # Global route and explicit congestion measurement.
 set congestion_report "$::env(RUN_DIR)/congestion.rpt"
