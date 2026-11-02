@@ -1,12 +1,33 @@
 
+# ============================================================
+# FIR FILTER - YOSYS SYNTHESIS SCRIPT
+# Parameterized for the 20-configuration physical-design sweep
+# ============================================================
+
+# ------------------------------------------------------------
+# 1. Read RTL
+# ------------------------------------------------------------
+
 read_verilog -sv rtl/fir_filter.v
+
+# ------------------------------------------------------------
+# 2. Apply configuration parameters
+# ------------------------------------------------------------
 
 chparam -set DATA_WIDTH __DATA_WIDTH__ \
         -set COEFF_WIDTH __COEFF_WIDTH__ \
         -set TAPS __TAPS__ \
         -set ACC_WIDTH __ACC_WIDTH__ fir_filter
 
+# ------------------------------------------------------------
+# 3. Check design hierarchy
+# ------------------------------------------------------------
+
 hierarchy -check -top fir_filter
+
+# ------------------------------------------------------------
+# 4. Generic synthesis
+# ------------------------------------------------------------
 
 proc
 flatten
@@ -18,8 +39,16 @@ opt
 techmap
 opt
 
+# ------------------------------------------------------------
+# 5. Technology mapping
+# ------------------------------------------------------------
+
 dfflibmap -liberty "__LIB_FILE__"
 abc -liberty "__LIB_FILE__"
+
+# ------------------------------------------------------------
+# 6. Clean and check synthesized design
+# ------------------------------------------------------------
 
 opt
 clean
@@ -32,7 +61,19 @@ opt
 clean
 check
 
-write_json fir_project/synth/fir_filter_netlist.json
-write_verilog -noattr -noexpr fir_project/synth/fir_filter_netlist.v
+# ------------------------------------------------------------
+# 7. Generate configuration-specific netlists
+# ------------------------------------------------------------
+
+write_json "__NETLIST_JSON__"
+write_verilog -noattr -noexpr "__NETLIST_VERILOG__"
+
+# ------------------------------------------------------------
+# 8. Synthesis statistics
+# ------------------------------------------------------------
 
 stat -liberty "__LIB_FILE__"
+
+# ============================================================
+# END OF SYNTHESIS SCRIPT
+# ============================================================
