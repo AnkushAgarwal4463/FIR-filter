@@ -57,9 +57,9 @@ if [[ "$COEFF_WIDTH" != "8" ]]; then
 fi
 
 case "$UTIL" in
-    30|40|50|60) ;;
+    20|30|40|50|60) ;;
     *)
-        echo "ERROR: UTIL must be 30, 40, 50, or 60."
+        echo "ERROR: UTIL must be 20, 30, 40, 50, or 60."
         exit 2
         ;;
 esac
