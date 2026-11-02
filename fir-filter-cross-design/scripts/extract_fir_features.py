@@ -828,6 +828,8 @@ def write_configuration_csv(outdir: Path, run_dir: Path, args: argparse.Namespac
     def_ok = bool(post["final_def_available"] and post["final_def_nonempty"])
     odb_ok = bool(post["final_odb_available"])
     route_success = bool(post["detailed_route_success_marker_found"])
+    # Read the Tcl stage-history record before using its status below.
+    tcl_status, tcl_stage = read_tcl_status(run_dir)
 
     if tcl_status == "completed" and def_ok and odb_ok:
         flow_status, last_stage = "completed", tcl_stage or "flow_completed"
