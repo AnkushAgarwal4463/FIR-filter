@@ -232,14 +232,14 @@ jobs:
 
             for taps in 4 8; do
               for data_width in 8 16; do
-                for utilization in 30 40 50 60; do
+                for utilization in 20 30 40 50; do
                   run_configuration \
                     "$taps" "$data_width" "$utilization" "10.0"
                 done
               done
             done
 
-            for utilization in 30 40 50 60; do
+            for utilization in 20 30 40 50; do
               run_configuration 12 8 "$utilization" "10.0"
             done
 
