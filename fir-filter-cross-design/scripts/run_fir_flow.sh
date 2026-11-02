@@ -187,5 +187,3 @@ if (( missing > 0 )); then
 fi
 
 echo "FIR flow finished. Review outputs under: $RUN_DIR"
-
-which files are these
