@@ -1,104 +1,442 @@
 name: FIR Synthesis and Physical Design
 
 on:
+  workflow_dispatch:
+    inputs:
+      utilization:
+        description: "Target floorplan utilization (%)"
+        required: true
+        default: "40"
+      clock_period:
+        description: "Clock period (ns)"
+        required: true
+        default: "10.0"
+
   push:
     paths:
-      - "fir-filter-cross-design/**"
+      - "fir-filter-cross-design/rtl/**"
+      - "fir-filter-cross-design/tb/**"
+      - "fir-filter-cross-design/scripts/**"
+      - "fir-filter-cross-design/constraints/**"
+      - "fir-filter-cross-design/config/**"
+      - "fir-filter-cross-design/Makefile"
+      - "fir-filter-cross-design/README.md"
+      - "environment.yml"
       - ".github/workflows/fir-physical-design.yml"
 
   pull_request:
     paths:
-      - "fir-filter-cross-design/**"
+      - "fir-filter-cross-design/rtl/**"
+      - "fir-filter-cross-design/tb/**"
+      - "fir-filter-cross-design/scripts/**"
+      - "fir-filter-cross-design/constraints/**"
+      - "fir-filter-cross-design/config/**"
+      - "fir-filter-cross-design/Makefile"
+      - "fir-filter-cross-design/README.md"
+      - "environment.yml"
       - ".github/workflows/fir-physical-design.yml"
 
-  workflow_dispatch:
+permissions:
+  contents: read
+
+concurrency:
+  group: fir-pd-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   fir-physical-design:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    container:
+      image: openroad/orfs:latest
+
     defaults:
       run:
         working-directory: fir-filter-cross-design
+        shell: bash -el {0}
+
+    env:
+      UTIL: ${{ inputs.utilization || '40' }}
+      CLK_PERIOD: ${{ inputs.clock_period || '10.0' }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Micromamba
-        uses: mamba-org/setup-micromamba@v2
-        with:
-          environment-file: fir-filter-cross-design/environment.yml
-          environment-name: fir-pd-flow
-          cache-environment: true
-
-      - name: Verify installed tools
-        shell: bash -el {0}
+      - name: Check project structure
         run: |
-          yosys -V
-          openroad -version
-          iverilog -V
-          python3 --version
+          set -euo pipefail
+          echo "Project directory: $PWD"
+          test -f ../environment.yml || {
+            echo "ERROR: environment.yml missing from repository root."
+            exit 1
+          }
 
-      - name: Verify Sky130 PDK files
-        shell: bash -el {0}
-        run: |
-          source config/sky130_example.env
+          files=(
+            "Makefile"
+            "rtl/fir_filter.v"
+            "tb/tb_fir_filter.v"
+            "scripts/run_fir_flow.sh"
+            "scripts/flow_fir.tcl"
+            "scripts/synth_fir.ys"
+            "scripts/extract_fir_features.py"
+            "constraints/fir_filter.sdc.in"
+            "config/sky130_example.env"
+          )
 
-          for file in "$LIBERTY" "$TECH_LEF" "$CELL_LEF"; do
-            if [[ ! -f "$file" ]]; then
-              echo "ERROR: PDK file not found: $file"
-              exit 1
+          missing=0
+          for file in "${files[@]}"; do
+            if [[ -f "$file" ]]; then
+              echo "FOUND: $file"
+            else
+              echo "MISSING: $file"
+              missing=$((missing + 1))
             fi
-            echo "Found: $file"
           done
 
-      - name: Run FIR RTL simulation
-        shell: bash -el {0}
+          if [[ "$missing" -ne 0 ]]; then
+            echo "ERROR: $missing required project file(s) are missing."
+            exit 1
+          fi
+
+      - name: Set up Python, Yosys, and Icarus Verilog
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: ${{ github.workspace }}/environment.yml
+          environment-name: fir-pd-flow
+          cache-environment: true
+          init-shell: bash
+          post-cleanup: none
+
+      - name: Verify tools and validate scripts
         run: |
+          set -euo pipefail
+          source /OpenROAD-flow-scripts/env.sh
+
+          command -v python
+          python --version
+          command -v yosys
+          yosys -V
+          command -v iverilog
+          iverilog -V > /tmp/iverilog-version.txt 2>&1 || true
+          sed -n '1,3p' /tmp/iverilog-version.txt
+          command -v openroad
+          openroad -version
+
+          bash -n scripts/run_fir_flow.sh
+          python -m py_compile scripts/extract_fir_features.py
+          echo "SUCCESS: Tools and scripts passed validation."
+
+      - name: Configure and verify Sky130HD PDK
+        run: |
+          set -euo pipefail
+          source /OpenROAD-flow-scripts/env.sh
+
+          ORFS_PLATFORM="/OpenROAD-flow-scripts/flow/platforms/sky130hd"
+          LIBERTY_PATH="$ORFS_PLATFORM/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"
+          TECH_LEF_PATH="$ORFS_PLATFORM/lef/sky130_fd_sc_hd.tlef"
+          CELL_LEF_PATH="$ORFS_PLATFORM/lef/sky130_fd_sc_hd_merged.lef"
+
+          for file in "$LIBERTY_PATH" "$TECH_LEF_PATH" "$CELL_LEF_PATH"; do
+            if [[ ! -f "$file" ]]; then
+              echo "ERROR: Expected Sky130HD file not found: $file"
+              find "$ORFS_PLATFORM" -maxdepth 4 -type f \
+                \( -name "*.lib" -o -name "*.lef" \) -print 2>/dev/null | sort || true
+              exit 1
+            fi
+            echo "FOUND: $file"
+          done
+
+          sed -i -E \
+            "s|^export LIBERTY=.*|export LIBERTY=\"$LIBERTY_PATH\"|" \
+            config/sky130_example.env
+          sed -i -E \
+            "s|^export TECH_LEF=.*|export TECH_LEF=\"$TECH_LEF_PATH\"|" \
+            config/sky130_example.env
+          sed -i -E \
+            "s|^export CELL_LEF=.*|export CELL_LEF=\"$CELL_LEF_PATH\"|" \
+            config/sky130_example.env
+
+          source config/sky130_example.env
+          test -f "$LIBERTY"
+          test -f "$TECH_LEF"
+          test -f "$CELL_LEF"
+          echo "Sky130HD PDK paths configured and verified."
+
+      - name: Run RTL simulation
+        run: |
+          set -euo pipefail
           make sim
 
-      - name: Check FIR RTL with Yosys
-        shell: bash -el {0}
-        run: |
-          yosys -p "
-            read_verilog -sv rtl/fir_filter.v
-            hierarchy -check -top fir_filter
-            proc
-            opt
-            check
-          "
-
       - name: Run FIR synthesis and physical design
-        shell: bash -el {0}
         run: |
+          set -euo pipefail
+          source /OpenROAD-flow-scripts/env.sh
+
+          # %g normalizes 10.0 -> 10 without turning 20 into 2.
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN { printf "%g", c + 0 }')"
+          export PLACE_DENSITY="$(awk -v u="$UTIL" 'BEGIN { printf "%.2f", u / 100 }')"
+          export CLK_PERIOD_NS="$CLK_PERIOD"
+          export RUN_TAG="fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
+          export RUN_DIR="fir_project/runs/${RUN_TAG}"
+
+          echo "RUN_TAG=$RUN_TAG"
+          echo "RUN_DIR=$RUN_DIR"
+          echo "UTIL=$UTIL"
+          echo "PLACE_DENSITY=$PLACE_DENSITY"
+          echo "CLK_PERIOD=$CLK_PERIOD"
+
           chmod +x scripts/run_fir_flow.sh
           ./scripts/run_fir_flow.sh
 
-      - name: Verify generated outputs
-        if: success()
-        shell: bash -el {0}
+      
+      - name: Diagnose congestion and fanout inputs
+        if: always()
         run: |
-          echo "Checking synthesis outputs..."
-          test -s fir_project/synth/fir_filter_netlist.v
-          test -s fir_project/synth/fir_filter_netlist.json
+          set -u
 
-          echo "Checking physical-design outputs..."
-          test -s fir_project/runs/fir_8tap_w8_util40_clk10/final.def
-          test -s fir_project/runs/fir_8tap_w8_util40_clk10/final.odb
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN { printf "%g", c + 0 }')"
+          RUN_DIR="fir_project/runs/fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
+          NETLIST_JSON="fir_project/synth/fir_filter_netlist.json"
 
-          echo "Checking feature outputs..."
-          test -s fir_project/runs/fir_8tap_w8_util40_clk10/features.csv
-          test -s fir_project/runs/fir_8tap_w8_util40_clk10/features.json
+          echo "===== RUN DIRECTORY: $RUN_DIR ====="
 
-          echo "All required outputs are present."
+          echo "===== CONGESTION OVERFLOW REPORT ====="
+          if [[ -s "$RUN_DIR/congestion_overflow.rpt" ]]; then
+            cat "$RUN_DIR/congestion_overflow.rpt"
+          else
+            echo "MISSING OR EMPTY: congestion_overflow.rpt"
+          fi
 
-      - name: Upload FIR flow artifacts
+          echo "===== GLOBAL ROUTING CONGESTION REPORT ====="
+          if [[ -s "$RUN_DIR/congestion.rpt" ]]; then
+            sed -n '1,120p' "$RUN_DIR/congestion.rpt"
+          else
+            echo "MISSING OR EMPTY: congestion.rpt"
+          fi
+
+          echo "===== CONGESTION MARKERS IN LOGS ====="
+          grep -n -i -E \
+            'GLOBAL_ROUTE_HAS_CONGESTION|GLOBAL_ROUTE_STATUS|overflow|congestion' \
+            "$RUN_DIR/flow_diagnostics.log" "$RUN_DIR/openroad_log.txt" \
+            2>/dev/null || true
+
+          echo "===== NETLIST JSON STRUCTURE ====="
+          python - "$NETLIST_JSON" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          if not path.is_file():
+              print(f"MISSING: {path}")
+              raise SystemExit(0)
+
+          try:
+              data = json.loads(path.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError) as exc:
+              print(f"Could not parse JSON: {exc}")
+              raise SystemExit(0)
+
+          print("Top-level keys:", list(data.keys()))
+          modules = data.get("modules", {})
+          print("Modules:", list(modules.keys()))
+
+          for module_name, module in modules.items():
+              print(f"\nMODULE: {module_name}")
+              ports = module.get("ports", {})
+              cells = module.get("cells", {})
+              print("Module keys:", list(module.keys()))
+              print("Port count:", len(ports))
+              for name, port in list(ports.items())[:5]:
+                  print("PORT SAMPLE:", name, json.dumps(port))
+
+              print("Cell count:", len(cells))
+              for name, cell in list(cells.items())[:2]:
+                  print(f"CELL SAMPLE: {name}")
+                  print(json.dumps(cell, indent=2)[:2500])
+          PY
+    
+
+      # Do not add a post-flow step that rewrites fir_features.csv.
+      # The extractor reads Tcl status history and owns this CSV output.
+
+      - name: Create tabular feature summary
+        if: always()
+        run: |
+          set -euo pipefail
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN { printf "%g", c + 0 }')"
+          RUN_TAG="fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
+          export FIR_SUMMARY_RUN_DIR="fir_project/runs/${RUN_TAG}"
+          export SUMMARY_FILE="${GITHUB_STEP_SUMMARY:?GITHUB_STEP_SUMMARY is not set}"
+
+          python -u - <<'PY'
+          import csv
+          import json
+          import os
+          from pathlib import Path
+
+          run_dir = Path(os.environ["FIR_SUMMARY_RUN_DIR"])
+          summary_path = Path(os.environ["SUMMARY_FILE"])
+
+          def md(value):
+              if value is None:
+                  return ""
+              return str(value).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+          def render_csv(out, title, filename, columns=None):
+              path = run_dir / filename
+              out.write(f"## {title}\n\n")
+              if not path.is_file():
+                  out.write(f"> File not found: `{filename}`\n\n")
+                  print(f"WARNING: missing {path}")
+                  return
+              try:
+                  with path.open("r", newline="", encoding="utf-8-sig") as handle:
+                      reader = csv.DictReader(handle)
+                      headers = reader.fieldnames or []
+                      rows = list(reader)
+              except (OSError, csv.Error, UnicodeError) as exc:
+                  out.write(f"> Could not read `{filename}`: {md(exc)}\n\n")
+                  return
+              if not headers:
+                  out.write("> CSV has no header row.\n\n")
+                  return
+              if not rows:
+                  out.write("> CSV contains a header but no data rows.\n\n")
+                  return
+              selected = [c for c in columns if c in headers] if columns else headers
+              if not selected:
+                  selected = headers
+              out.write("| " + " | ".join(map(md, selected)) + " |\n")
+              out.write("| " + " | ".join("---" for _ in selected) + " |\n")
+              for row in rows:
+                  out.write("| " + " | ".join(md(row.get(c, "")) for c in selected) + " |\n")
+              out.write("\n")
+              print(f"Rendered {filename}: {len(rows)} row(s)")
+
+          def render_status_json(out):
+              path = run_dir / "extraction_status.json"
+              if not path.is_file():
+                  return
+              try:
+                  data = json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, json.JSONDecodeError) as exc:
+                  out.write(f"> Could not read extraction status: {md(exc)}\n\n")
+                  return
+              out.write("## Extraction diagnostics\n\n")
+              out.write("| Check | Value |\n| --- | --- |\n")
+              for key, value in data.items():
+                  if isinstance(value, (dict, list)):
+                      value = json.dumps(value, sort_keys=True)
+                  out.write(f"| {md(key)} | {md(value)} |\n")
+              out.write("\n")
+
+          with summary_path.open("a", encoding="utf-8") as out:
+              out.write("# FIR Physical-Design Results\n\n")
+              out.write(f"**Run:** `{run_dir.name}`\n\n")
+              out.write(f"**Run directory:** `{run_dir}`\n\n")
+              render_csv(out, "FIR Configuration and Flow Status", "fir_features.csv")
+              render_csv(out, "Flow Status History", "fir_features_status.csv")
+              render_csv(out, "Physical-Design Targets", "physical_targets.csv", [
+                  "final_def_available", "final_odb_available", "routed_net_count",
+                  "route_segment_count", "wirelength_um", "via_count",
+                  "final_detailed_route_violations", "effective_place_density",
+                  "effective_place_density_method", "design_area_um2", "wns_setup_ns",
+                  "tns_setup_ns", "wns_hold_ns", "congestion_overflow",
+                  "congestion_report_source", "target_measurement_status"
+              ])
+              render_csv(out, "Extracted Netlist and Physical Features", "features.csv", [
+                  "design_id", "run_id", "cell_count", "sequential_cell_count",
+                  "combinational_cell_count", "buffer_inverter_count", "other_cell_count",
+                  "unique_cell_type_count", "avg_bit_fanout", "max_bit_fanout",
+                  "fanout_direction_coverage_percent", "fanout_metadata_complete_for_all_cells",
+                  "fanout_method", "fanout_quality_warning", "wirelength_um", "via_count",
+                  "wns_setup_ns", "tns_setup_ns", "wns_hold_ns", "congestion_overflow",
+                  "design_area_um2", "target_measurement_status"
+              ])
+              render_csv(out, "Pre-placement Features", "preplacement_features.csv", [
+                  "design_id", "run_id", "cell_count", "sequential_cell_count",
+                  "combinational_cell_count", "buffer_inverter_count", "other_cell_count",
+                  "unique_cell_type_count", "avg_bit_fanout", "max_bit_fanout",
+                  "fanout_direction_coverage_percent", "fanout_metadata_complete_for_all_cells",
+                  "fanout_method", "fanout_quality_warning", "utilization_constraint_percent",
+                  "clock_period_ns", "taps", "data_width", "coeff_width", "acc_width", "place_density"
+              ])
+              render_status_json(out)
+              out.write("---\n\nGenerated by the FIR Physical Design workflow.\n")
+
+          print(f"Summary written to {summary_path}")
+          PY
+
+          echo "===== Summary file ====="
+          ls -lh "$SUMMARY_FILE"
+          tail -n 40 "$SUMMARY_FILE"
+
+      - name: Inspect timing, routing, and congestion reports
+        if: always()
+        run: |
+          set -uo pipefail
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN { printf "%g", c + 0 }')"
+          RUN_DIR="fir_project/runs/fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
+
+          if [[ ! -d "$RUN_DIR" ]]; then
+            echo "Run directory not found: $RUN_DIR"
+            exit 0
+          fi
+
+          find "$RUN_DIR" -type f \
+            \( -iname '*timing*.rpt' -o -iname '*congestion*' -o -iname '*route*.log' \
+               -o -iname '*drc*' -o -name 'flow_diagnostics.log' \
+               -o -name 'fir_features_status.csv' \) -print | sort
+
+          for file in \
+            "$RUN_DIR/timing_setup.rpt" \
+            "$RUN_DIR/timing_hold.rpt" \
+            "$RUN_DIR/congestion.rpt" \
+            "$RUN_DIR/flow_diagnostics.log" \
+            "$RUN_DIR/fir_features_status.csv"; do
+            if [[ -s "$file" ]]; then
+              echo "===== $file ====="
+              sed -n '1,160p' "$file"
+            fi
+          done
+
+          if [[ -s "$RUN_DIR/openroad_log.txt" ]]; then
+            echo "===== Routing/timing log matches ====="
+            grep -Ein \
+              'Complete detail routing|SUCCESS: Detailed routing|Number of violations|Total wire length|Total number of vias|overflow|congestion|slack|wns|tns' \
+              "$RUN_DIR/openroad_log.txt" || true
+          fi
+
+      - name: Display generated files
+        if: always()
+        run: |
+          set -uo pipefail
+          CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN { printf "%g", c + 0 }')"
+          RUN_DIR="fir_project/runs/fir_8tap_w8_util${UTIL}_clk${CLK_TAG}"
+
+          for name in \
+            fir_features.csv fir_features_status.csv features.csv \
+            physical_targets.csv preplacement_features.csv extraction_status.json \
+            run_report.md final.def final.odb openroad_log.txt flow_diagnostics.log; do
+            file="$RUN_DIR/$name"
+            if [[ -s "$file" ]]; then
+              echo "AVAILABLE: $file"
+              if [[ "$file" == *.csv ]]; then wc -l "$file"; fi
+            else
+              echo "MISSING OR EMPTY: $file"
+            fi
+          done
+
+      - name: Upload FIR physical-design artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fir-physical-design-results
-          path: |
-            fir-filter-cross-design/fir_project/synth/
-            fir-filter-cross-design/fir_project/runs/
+          name: fir-physical-design-${{ github.run_number }}
           if-no-files-found: warn
           retention-days: 14
+          path: |
+            fir-filter-cross-design/fir_project/synth/**
+            fir-filter-cross-design/fir_project/runs/**
