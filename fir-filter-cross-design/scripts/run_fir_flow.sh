@@ -133,6 +133,30 @@ python3 scripts/extract_fir_features.py \
   --place-density "$PLACE_DENSITY" \
   --clock-period "$CLK_PERIOD"
 
+
+echo "===== VERIFY PHYSICAL TARGETS CSV ====="
+python3 - "$RUN_DIR/physical_targets.csv" <<'PY'
+import csv
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+
+print("CSV path:", path.resolve())
+print("File exists:", path.is_file())
+
+if path.is_file():
+    with path.open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        print("Columns:", reader.fieldnames)
+        rows = list(reader)
+        print("Row count:", len(rows))
+
+        if rows:
+            for key, value in rows[0].items():
+                if "congestion" in key or "routing" in key:
+                    print(f"{key} = {value}")
+PY
 # ------------------------------------------------------------
 # Validate output files (not the values inside them)
 # ------------------------------------------------------------
