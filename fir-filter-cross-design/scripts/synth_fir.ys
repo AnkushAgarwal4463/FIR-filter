@@ -1,11 +1,10 @@
-# FIR synthesis template. The runner replaces __LIB_FILE__ and output paths.
 
 read_verilog -sv rtl/fir_filter.v
 
-chparam -set DATA_WIDTH 8 \
-        -set COEFF_WIDTH 8 \
-        -set TAPS 8 \
-        -set ACC_WIDTH 24 fir_filter
+chparam -set DATA_WIDTH __DATA_WIDTH__ \
+        -set COEFF_WIDTH __COEFF_WIDTH__ \
+        -set TAPS __TAPS__ \
+        -set ACC_WIDTH __ACC_WIDTH__ fir_filter
 
 hierarchy -check -top fir_filter
 
@@ -25,7 +24,6 @@ abc -liberty "__LIB_FILE__"
 opt
 clean
 
-# Map constant logic values to Sky130HD tie cells.
 hilomap -singleton \
     -hicell sky130_fd_sc_hd__conb_1 HI \
     -locell sky130_fd_sc_hd__conb_1 LO
@@ -34,9 +32,7 @@ opt
 clean
 check
 
-# Write synthesized netlist and JSON.
 write_json fir_project/synth/fir_filter_netlist.json
 write_verilog -noattr -noexpr fir_project/synth/fir_filter_netlist.v
 
-# Report synthesis statistics.
 stat -liberty "__LIB_FILE__"
