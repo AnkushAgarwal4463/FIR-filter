@@ -23,7 +23,6 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     exit 1
 fi
 
-# Preserve externally supplied environment variables.
 export TAPS="${TAPS:-8}"
 export DATA_WIDTH="${DATA_WIDTH:-8}"
 export COEFF_WIDTH="${COEFF_WIDTH:-8}"
@@ -35,7 +34,6 @@ export PLACE_DENSITY="${PLACE_DENSITY:-$(awk "BEGIN {print ${UTIL}/100}")}"
 
 source "$CONFIG_FILE"
 
-# Reapply defaults in case the configuration file sets them.
 export TAPS="${TAPS:-8}"
 export DATA_WIDTH="${DATA_WIDTH:-8}"
 export COEFF_WIDTH="${COEFF_WIDTH:-8}"
@@ -175,6 +173,12 @@ sed \
 
 echo "Generated synthesis script: $GENERATED_SYNTH"
 
+if grep -Eq '__[A-Z_]+__' "$GENERATED_SYNTH"; then
+    echo "ERROR: Unresolved placeholders in generated Yosys script."
+    grep -nE '__[A-Z_]+__' "$GENERATED_SYNTH"
+    exit 1
+fi
+
 # ------------------------------------------------------------
 # 9. Run Yosys synthesis
 # ------------------------------------------------------------
@@ -182,18 +186,52 @@ echo "Generated synthesis script: $GENERATED_SYNTH"
 echo
 echo "===== RUNNING YOSYS SYNTHESIS ====="
 
+# Remove old outputs to prevent stale netlists being reused.
+rm -f "$NETLIST" "$NETLIST_JSON"
+
 yosys -s "$GENERATED_SYNTH" \
     2>&1 | tee "${RUN_DIR}/yosys.log"
 
-if [[ ! -f "$NETLIST" ]]; then
-    echo "ERROR: Synthesized Verilog netlist not generated."
+echo
+echo "===== VERIFY YOSYS NETLIST OUTPUTS ====="
+
+if [[ ! -s "$NETLIST" ]]; then
+    echo "ERROR: Synthesized Verilog netlist is missing or empty."
     exit 1
 fi
 
-if [[ ! -f "$NETLIST_JSON" ]]; then
-    echo "ERROR: Synthesized JSON netlist not generated."
+if [[ ! -s "$NETLIST_JSON" ]]; then
+    echo "ERROR: Synthesized JSON netlist is missing or empty."
+    ls -lh "$SYNTH_DIR"
     exit 1
 fi
+
+python3 - "$NETLIST_JSON" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+
+try:
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+except (json.JSONDecodeError, OSError) as exc:
+    raise SystemExit(f"ERROR: Invalid Yosys JSON netlist: {exc}")
+
+if not isinstance(data, dict) or not isinstance(data.get("modules"), dict):
+    raise SystemExit("ERROR: JSON does not contain a valid Yosys modules object.")
+
+if not data["modules"]:
+    raise SystemExit("ERROR: Yosys JSON contains no modules.")
+
+print("JSON validation: PASSED")
+print("JSON size:", path.stat().st_size, "bytes")
+print("Modules:", list(data["modules"].keys()))
+PY
+
+echo "Verilog netlist: $NETLIST"
+echo "JSON netlist   : $NETLIST_JSON"
 
 # ------------------------------------------------------------
 # 10. Generate SDC
@@ -237,7 +275,7 @@ echo "===== EXTRACTING FEATURES AND PHYSICAL TARGETS ====="
 
 python3 scripts/extract_fir_features.py \
     --run-dir "$RUN_DIR" \
-    --netlist "$NETLIST" \
+    --netlist-json "$NETLIST_JSON" \
     --taps "$TAPS" \
     --data-width "$DATA_WIDTH" \
     --coeff-width "$COEFF_WIDTH" \
