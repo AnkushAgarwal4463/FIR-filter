@@ -106,11 +106,29 @@ CLK_TAG="$(awk -v c="$CLK_PERIOD" 'BEGIN { printf "%g", c + 0 }')"
 
 export RUN_TAG="fir_t${TAPS}_dw${DATA_WIDTH}_cw${COEFF_WIDTH}_aw${ACC_WIDTH}_u${UTIL}_clk${CLK_TAG}"
 
-# Do not permit a caller to silently override the run identity.
 if [[ -n "${RUN_TAG_OVERRIDE:-}" ]]; then
     echo "ERROR: RUN_TAG_OVERRIDE is not supported."
     echo "RUN_TAG is generated from the actual configuration."
     exit 2
+fi
+
+# ------------------------------------------------------------
+# 3A. Select timing-repair policy
+# ------------------------------------------------------------
+
+# Default: preserve the original physical-design flow.
+export ENABLE_REPAIR_TIMING=1
+
+# Diagnostic experiment:
+# Disable timing repair only for the four previously failing
+# configurations: TAPS=8, DATA_WIDTH=16, UTIL=20/30/40/50.
+
+if [[ "$TAPS" == "8" && "$DATA_WIDTH" == "16" ]]; then
+    case "$UTIL" in
+        20|30|40|50)
+            export ENABLE_REPAIR_TIMING=0
+            ;;
+    esac
 fi
 
 export RUN_DIR="fir_project/runs/${RUN_TAG}"
@@ -132,17 +150,18 @@ echo "============================================================"
 echo "FIR CONFIGURATION"
 echo "============================================================"
 
-printf 'TAPS          = %s\n' "$TAPS"
-printf 'DATA_WIDTH    = %s\n' "$DATA_WIDTH"
-printf 'COEFF_WIDTH   = %s\n' "$COEFF_WIDTH"
-printf 'ACC_WIDTH     = %s\n' "$ACC_WIDTH"
-printf 'UTIL          = %s\n' "$UTIL"
-printf 'PLACE_DENSITY = %s\n' "$PLACE_DENSITY"
-printf 'CLK_PERIOD    = %s ns\n' "$CLK_PERIOD"
-printf 'RUN_TAG       = %s\n' "$RUN_TAG"
-printf 'RUN_DIR       = %s\n' "$RUN_DIR"
-printf 'NETLIST       = %s\n' "$NETLIST"
-printf 'NETLIST_JSON  = %s\n' "$NETLIST_JSON"
+printf 'TAPS                 = %s\n' "$TAPS"
+printf 'DATA_WIDTH           = %s\n' "$DATA_WIDTH"
+printf 'COEFF_WIDTH          = %s\n' "$COEFF_WIDTH"
+printf 'ACC_WIDTH            = %s\n' "$ACC_WIDTH"
+printf 'UTIL                 = %s\n' "$UTIL"
+printf 'PLACE_DENSITY        = %s\n' "$PLACE_DENSITY"
+printf 'CLK_PERIOD           = %s ns\n' "$CLK_PERIOD"
+printf 'ENABLE_REPAIR_TIMING = %s\n' "$ENABLE_REPAIR_TIMING"
+printf 'RUN_TAG              = %s\n' "$RUN_TAG"
+printf 'RUN_DIR              = %s\n' "$RUN_DIR"
+printf 'NETLIST              = %s\n' "$NETLIST"
+printf 'NETLIST_JSON         = %s\n' "$NETLIST_JSON"
 
 echo "============================================================"
 
@@ -209,6 +228,9 @@ configuration = {
     "utilization": int(os.environ["UTIL"]),
     "place_density": float(os.environ["PLACE_DENSITY"]),
     "clock_period_ns": float(os.environ["CLK_PERIOD"]),
+    "repair_timing_enabled": (
+        os.environ["ENABLE_REPAIR_TIMING"] == "1"
+    ),
 }
 
 path = Path(sys.argv[1])
@@ -218,6 +240,7 @@ path.write_text(
 )
 
 print("Configuration metadata saved:", path)
+print("Timing repair enabled:", configuration["repair_timing_enabled"])
 PY
 
 # ------------------------------------------------------------
@@ -346,6 +369,8 @@ test -s "$SDC"
 echo
 echo "===== RUN OPENROAD PHYSICAL DESIGN ====="
 
+echo "Passing ENABLE_REPAIR_TIMING=$ENABLE_REPAIR_TIMING to OpenROAD."
+
 if ! openroad -exit scripts/flow_fir.tcl \
     2>&1 | tee "$RUN_DIR/openroad_log.txt"; then
 
@@ -436,13 +461,15 @@ echo "============================================================"
 echo "FIR PHYSICAL-DESIGN RUN COMPLETED"
 echo "============================================================"
 
-echo "Run ID:       $RUN_TAG"
-echo "Run directory: $RUN_DIR"
-echo "Netlist JSON:  $NETLIST_JSON"
-echo "Netlist Verilog: $NETLIST"
+echo "Run ID:             $RUN_TAG"
+echo "Run directory:      $RUN_DIR"
+echo "Netlist JSON:       $NETLIST_JSON"
+echo "Netlist Verilog:    $NETLIST"
+echo "Timing repair:      $ENABLE_REPAIR_TIMING"
 
 echo
 echo "Generated feature files:"
+
 ls -lh \
     "$RUN_DIR/features.csv" \
     "$RUN_DIR/physical_targets.csv" \
