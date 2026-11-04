@@ -55,30 +55,30 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    working-directory: fir-filter-cross-design
+    shell: bash -el {0}
+
 concurrency:
   group: fir-pd-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
-jobs:
-  fir-physical-design:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+env:
+  RUN_MODE: ${{ inputs.run_mode || 'sweep' }}
+  SINGLE_TAPS: ${{ inputs.taps || '8' }}
+  SINGLE_DATA_WIDTH: ${{ inputs.data_width || '8' }}
+  SINGLE_UTIL: ${{ inputs.utilization || '40' }}
+  CLK_PERIOD: ${{ inputs.clock_period || '10.0' }}
 
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     container:
       image: openroad/orfs:latest
-
-    defaults:
-      run:
-        working-directory: fir-filter-cross-design
-        shell: bash -el {0}
-
-    env:
-      RUN_MODE: ${{ inputs.run_mode || 'single' }}
-      SINGLE_TAPS: ${{ inputs.taps || '8' }}
-      SINGLE_DATA_WIDTH: ${{ inputs.data_width || '8' }}
-      SINGLE_UTIL: ${{ inputs.utilization || '40' }}
-      SINGLE_CLK_PERIOD: ${{ inputs.clock_period || '10.0' }}
-
+    outputs:
+      configurations: ${{ steps.matrix.outputs.configurations }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -86,9 +86,7 @@ jobs:
       - name: Check project structure
         run: |
           set -euo pipefail
-
           test -f ../environment.yml
-
           files=(
             Makefile
             rtl/fir_filter.v
@@ -97,15 +95,12 @@ jobs:
             scripts/flow_fir.tcl
             scripts/synth_fir.ys
             scripts/extract_fir_features.py
+            scripts/combine_fir_results.py
             constraints/fir_filter.sdc.in
             config/sky130_example.env
           )
-
           for file in "${files[@]}"; do
-            test -f "$file" || {
-              echo "ERROR: Missing $file"
-              exit 1
-            }
+            test -f "$file" || { echo "ERROR: Missing $file"; exit 1; }
             echo "FOUND: $file"
           done
 
@@ -118,314 +113,207 @@ jobs:
           init-shell: bash
           post-cleanup: none
 
-      - name: Verify tools and validate scripts
+      - name: Verify tools and run RTL simulation
         run: |
           set -euo pipefail
-
           source /OpenROAD-flow-scripts/env.sh
-
           python --version
           yosys -V
-          iverilog -V > /tmp/iverilog-version.txt 2>&1 || true
-          sed -n '1,3p' /tmp/iverilog-version.txt
           openroad -version
-
           bash -n scripts/run_fir_flow.sh
-          python -m py_compile scripts/extract_fir_features.py
+          python -m py_compile scripts/extract_fir_features.py scripts/combine_fir_results.py
+          make sim
 
-          echo "All tool and syntax checks passed."
+      - name: Generate configuration matrix
+        id: matrix
+        env:
+          MODE: ${{ env.RUN_MODE }}
+          TAPS: ${{ env.SINGLE_TAPS }}
+          DATA_WIDTH: ${{ env.SINGLE_DATA_WIDTH }}
+          UTILIZATION: ${{ env.SINGLE_UTIL }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          if os.environ["MODE"] == "single":
+              configs = [{
+                  "taps": int(os.environ["TAPS"]),
+                  "data_width": int(os.environ["DATA_WIDTH"]),
+                  "utilization": int(os.environ["UTILIZATION"]),
+              }]
+          else:
+              configs = [
+                  {"taps": taps, "data_width": width, "utilization": util}
+                  for taps, widths in ((4, (8, 16)), (8, (8, 16)), (12, (8,)))
+                  for width in widths
+                  for util in (20, 30, 40, 50)
+              ]
+          print("configurations=" + json.dumps({"include": configs}, separators=(",", ":")))
+          PY
+
+  fir-physical-design:
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    container:
+      image: openroad/orfs:latest
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix: ${{ fromJSON(needs.preflight.outputs.configurations) }}
+    env:
+      TAPS: ${{ matrix.taps }}
+      DATA_WIDTH: ${{ matrix.data_width }}
+      COEFF_WIDTH: 8
+      UTIL: ${{ matrix.utilization }}
+      CLK_PERIOD: ${{ inputs.clock_period || '10.0' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python and EDA environment
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: ${{ github.workspace }}/environment.yml
+          environment-name: fir-pd-flow
+          cache-environment: true
+          init-shell: bash
+          post-cleanup: none
 
       - name: Configure and verify Sky130HD PDK
         run: |
           set -euo pipefail
-
           source /OpenROAD-flow-scripts/env.sh
-
           ORFS_PLATFORM="/OpenROAD-flow-scripts/flow/platforms/sky130hd"
-
-          LIBERTY_PATH="$ORFS_PLATFORM/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"
-          TECH_LEF_PATH="$ORFS_PLATFORM/lef/sky130_fd_sc_hd.tlef"
-          CELL_LEF_PATH="$ORFS_PLATFORM/lef/sky130_fd_sc_hd_merged.lef"
-
-          for file in "$LIBERTY_PATH" "$TECH_LEF_PATH" "$CELL_LEF_PATH"; do
-            test -f "$file" || {
-              echo "ERROR: Missing PDK file: $file"
-              exit 1
-            }
+          export LIBERTY="$ORFS_PLATFORM/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"
+          export TECH_LEF="$ORFS_PLATFORM/lef/sky130_fd_sc_hd.tlef"
+          export CELL_LEF="$ORFS_PLATFORM/lef/sky130_fd_sc_hd_merged.lef"
+          for file in "$LIBERTY" "$TECH_LEF" "$CELL_LEF"; do
+            test -s "$file" || { echo "ERROR: Missing PDK file: $file"; exit 1; }
             echo "FOUND: $file"
           done
+          sed -i -E "s|^export LIBERTY=.*|export LIBERTY=\"$LIBERTY\"|" config/sky130_example.env
+          sed -i -E "s|^export TECH_LEF=.*|export TECH_LEF=\"$TECH_LEF\"|" config/sky130_example.env
+          sed -i -E "s|^export CELL_LEF=.*|export CELL_LEF=\"$CELL_LEF\"|" config/sky130_example.env
 
-          sed -i -E \
-            "s|^export LIBERTY=.*|export LIBERTY=\"$LIBERTY_PATH\"|" \
-            config/sky130_example.env
-
-          sed -i -E \
-            "s|^export TECH_LEF=.*|export TECH_LEF=\"$TECH_LEF_PATH\"|" \
-            config/sky130_example.env
-
-          sed -i -E \
-            "s|^export CELL_LEF=.*|export CELL_LEF=\"$CELL_LEF_PATH\"|" \
-            config/sky130_example.env
-
-          source config/sky130_example.env
-
-          test -f "$LIBERTY"
-          test -f "$TECH_LEF"
-          test -f "$CELL_LEF"
-
-          echo "Sky130HD configuration verified."
-
-      - name: Run RTL simulation
+      - name: Run FIR physical-design configuration
+        id: physical_flow
         run: |
           set -euo pipefail
-          make sim
-
-      - name: Run FIR physical-design configurations
-        run: |
-          set -euo pipefail
-
           source /OpenROAD-flow-scripts/env.sh
-
           chmod +x scripts/run_fir_flow.sh
+          echo "Configuration: taps=$TAPS data_width=$DATA_WIDTH utilization=$UTIL clock_period=$CLK_PERIOD ns"
+          ./scripts/run_fir_flow.sh
 
-          COEFF_WIDTH=8
-          CLK_PERIOD="$SINGLE_CLK_PERIOD"
-
-          run_configuration() {
-            local taps="$1"
-            local data_width="$2"
-            local utilization="$3"
-            local clock="$4"
-
-            local acc_width=$((data_width + COEFF_WIDTH + 8))
-            local place_density
-
-            place_density="$(awk -v u="$utilization" \
-              'BEGIN { printf "%.2f", u / 100 }')"
-
-            echo
-            echo "========================================"
-            echo "Starting FIR configuration"
-            echo "TAPS          : $taps"
-            echo "DATA_WIDTH    : $data_width"
-            echo "COEFF_WIDTH   : $COEFF_WIDTH"
-            echo "ACC_WIDTH     : $acc_width"
-            echo "UTILIZATION   : $utilization"
-            echo "PLACE_DENSITY : $place_density"
-            echo "CLOCK_PERIOD  : $clock"
-            echo "========================================"
-
-            export TAPS="$taps"
-            export DATA_WIDTH="$data_width"
-            export COEFF_WIDTH
-            export ACC_WIDTH="$acc_width"
-            export UTIL="$utilization"
-            export PLACE_DENSITY="$place_density"
-            export CLK_PERIOD_NS="$clock"
-
-            ./scripts/run_fir_flow.sh
-          }
-
-          if [[ "$RUN_MODE" == "sweep" ]]; then
-
-            echo "Starting the complete 20-configuration FIR sweep."
-
-            for taps in 4 8; do
-              for data_width in 8 16; do
-                for utilization in 20 30 40 50; do
-                  run_configuration \
-                    "$taps" "$data_width" "$utilization" "10.0"
-                done
-              done
-            done
-
-            for utilization in 20 30 40 50; do
-              run_configuration 12 8 "$utilization" "10.0"
-            done
-
-          elif [[ "$RUN_MODE" == "single" ]]; then
-
-            run_configuration \
-              "$SINGLE_TAPS" \
-              "$SINGLE_DATA_WIDTH" \
-              "$SINGLE_UTIL" \
-              "$SINGLE_CLK_PERIOD"
-
-          else
-            echo "ERROR: Unsupported RUN_MODE: $RUN_MODE"
-            exit 1
-          fi
-
-          echo "FIR configuration execution completed."
-
-      - name: Diagnose generated runs
+      - name: Record configuration status and failure diagnostics
         if: always()
-        run: |
-          set -u
-
-          echo "===== FIR RUN DIRECTORIES ====="
-
-          if [[ ! -d fir_project/runs ]]; then
-            echo "No run directory was generated."
-            exit 0
-          fi
-
-          find fir_project/runs -mindepth 1 -maxdepth 1 \
-            -type d -name 'fir_t*' | sort
-
-          while IFS= read -r run_dir; do
-            [[ -n "$run_dir" ]] || continue
-
-            echo
-            echo "========================================"
-            echo "RUN: $run_dir"
-            echo "========================================"
-
-            for file in \
-              final.def \
-              final.odb \
-              congestion.rpt \
-              congestion_overflow.rpt \
-              openroad_log.txt \
-              flow_diagnostics.log \
-              fir_features.csv \
-              physical_targets.csv \
-              preplacement_features.csv \
-              extraction_status.json; do
-
-              if [[ -s "$run_dir/$file" ]]; then
-                echo "AVAILABLE: $file"
-              else
-                echo "MISSING OR EMPTY: $file"
-              fi
-            done
-
-            if [[ -s "$run_dir/openroad_log.txt" ]]; then
-              grep -Ein \
-                'Complete detail routing|SUCCESS: Detailed routing|Number of violations|Total wire length|Total number of vias|overflow|congestion|slack|wns|tns' \
-                "$run_dir/openroad_log.txt" || true
-            fi
-
-          done < <(
-            find fir_project/runs -mindepth 1 -maxdepth 1 \
-              -type d -name 'fir_t*' | sort
-          )
-
-      - name: Create consolidated GitHub summary
-        if: always()
+        env:
+          FLOW_OUTCOME: ${{ steps.physical_flow.outcome }}
         run: |
           set -euo pipefail
-
-          export SUMMARY_FILE="${GITHUB_STEP_SUMMARY:?}"
-
-          python -u - <<'PY'
+          mkdir -p fir_project/matrix-status
+          python - <<'PY'
           import csv
           import json
           import os
+          import re
           from pathlib import Path
 
-          root = Path("fir_project/runs")
-          summary = Path(os.environ["SUMMARY_FILE"])
-
-          def clean(value):
-              if value is None:
-                  return ""
-              if isinstance(value, (dict, list)):
-                  value = json.dumps(value, sort_keys=True)
-              return str(value).replace("|", "\\|").replace("\n", " ")
-
-          def read_csv(path):
-              if not path.is_file():
-                  return [], []
+          taps = int(os.environ["TAPS"])
+          data_width = int(os.environ["DATA_WIDTH"])
+          coeff_width = int(os.environ["COEFF_WIDTH"])
+          utilization = int(os.environ["UTIL"])
+          clock = float(os.environ["CLK_PERIOD"])
+          acc_width = data_width + coeff_width + 8
+          run_id = f"fir_t{taps}_dw{data_width}_cw{coeff_width}_aw{acc_width}_u{utilization}_clk{clock:g}"
+          run_dir = Path("fir_project/runs") / run_id
+          stage = "unknown"
+          status_csv = run_dir / "fir_features_status.csv"
+          if status_csv.is_file():
               try:
-                  with path.open(newline="", encoding="utf-8-sig") as f:
-                      reader = csv.DictReader(f)
-                      return reader.fieldnames or [], list(reader)
-              except (OSError, csv.Error, UnicodeError):
-                  return [], []
+                  with status_csv.open(newline="", encoding="utf-8-sig") as handle:
+                      rows = list(csv.DictReader(handle))
+                  if rows:
+                      stage = rows[-1].get("last_completed_stage") or "unknown"
+              except (OSError, csv.Error):
+                  pass
 
-          runs = sorted(
-              p for p in root.glob("fir_t*")
-              if p.is_dir()
-          ) if root.is_dir() else []
+          reason = ""
+          for log_path in (run_dir / "openroad_log.txt", run_dir / "flow_diagnostics.log", run_dir / "synthesis.log"):
+              if not log_path.is_file():
+                  continue
+              try:
+                  lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+              except OSError:
+                  continue
+              matches = [line.strip() for line in lines if re.search(r"\b(ERROR|FATAL)\b|No access point", line, re.I)]
+              if matches:
+                  reason = matches[-1][-1000:]
+                  break
 
-          with summary.open("a", encoding="utf-8") as out:
-              out.write("# FIR Physical-Design Results\n\n")
-              out.write(f"**Run directories found:** {len(runs)}\n\n")
-
-              if not runs:
-                  out.write("No FIR run directories were generated.\n")
-              
-              for run in runs:
-                  out.write(f"## {run.name}\n\n")
-
-                  status_path = run / "extraction_status.json"
-                  if status_path.is_file():
-                      try:
-                          status = json.loads(status_path.read_text())
-                          out.write("### Extraction status\n\n")
-                          out.write("| Check | Value |\n|---|---|\n")
-                          for key, value in status.items():
-                              out.write(f"| {clean(key)} | {clean(value)} |\n")
-                          out.write("\n")
-                      except (OSError, json.JSONDecodeError):
-                          out.write("Could not parse extraction status.\n\n")
-
-                  for filename, title in [
-                      ("fir_features.csv", "Configuration"),
-                      ("preplacement_features.csv", "Pre-placement features"),
-                      ("physical_targets.csv", "Physical targets"),
-                  ]:
-                      headers, rows = read_csv(run / filename)
-                      out.write(f"### {title}\n\n")
-
-                      if not headers or not rows:
-                          out.write(f"File unavailable or empty: `{filename}`\n\n")
-                          continue
-
-                      selected = headers
-                      out.write("| " + " | ".join(map(clean, selected)) + " |\n")
-                      out.write("| " + " | ".join("---" for _ in selected) + " |\n")
-
-                      for row in rows:
-                          out.write(
-                              "| " + " | ".join(
-                                  clean(row.get(k, "")) for k in selected
-                              ) + " |\n"
-                          )
-                      out.write("\n")
-
-          print(f"Summary written: {summary}")
-          print(f"Run directories found: {len(runs)}")
+          record = {
+              "run_id": run_id,
+              "taps": taps,
+              "data_width": data_width,
+              "coeff_width": coeff_width,
+              "acc_width": acc_width,
+              "utilization": utilization,
+              "place_density": utilization / 100,
+              "clk_period_ns": clock,
+              "job_outcome": os.environ.get("FLOW_OUTCOME", "unknown"),
+              "last_completed_stage": stage,
+              "failure_reason": reason,
+          }
+          (Path("fir_project/matrix-status") / f"{run_id}.json").write_text(
+              json.dumps(record, indent=2) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(record, indent=2))
           PY
 
-      - name: Display generated files
-        if: always()
-        run: |
-          set -u
-
-          if [[ ! -d fir_project/runs ]]; then
-            echo "No FIR run directories found."
-            exit 0
-          fi
-
-          find fir_project/runs -type f \
-            \( -name 'fir_features.csv' \
-               -o -name 'fir_features_status.csv' \
-               -o -name 'features.csv' \
-               -o -name 'physical_targets.csv' \
-               -o -name 'preplacement_features.csv' \
-               -o -name 'extraction_status.json' \
-               -o -name 'run_report.md' \) \
-            -print | sort
-
-      - name: Upload FIR physical-design artifacts
+      - name: Upload this configuration's artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fir-physical-design-${{ github.run_number }}
+          name: fir-config-t${{ matrix.taps }}-dw${{ matrix.data_width }}-u${{ matrix.utilization }}
           if-no-files-found: warn
           retention-days: 14
           path: |
-            fir-filter-cross-design/fir_project/synth/**
             fir-filter-cross-design/fir_project/runs/**
+            fir-filter-cross-design/fir_project/matrix-status/**
+
+  combine-results:
+    if: ${{ always() }}
+    needs:
+      - preflight
+      - fir-physical-design
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download configuration artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fir-config-*
+          path: artifacts
+          merge-multiple: false
+          if-no-artifact-found: ignore
+
+      - name: Build combined CSV
+        env:
+          RUN_MODE: ${{ inputs.run_mode || 'sweep' }}
+          SINGLE_TAPS: ${{ inputs.taps || '8' }}
+          SINGLE_DATA_WIDTH: ${{ inputs.data_width || '8' }}
+          SINGLE_UTIL: ${{ inputs.utilization || '40' }}
+          CLK_PERIOD: ${{ inputs.clock_period || '10.0' }}
+        run: python3 fir-filter-cross-design/scripts/combine_fir_results.py --artifacts artifacts --output combined_fir_features.csv
+
+      - name: Upload combined CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fir-combined-results-${{ github.run_number }}
+          path: combined_fir_features.csv
+          if-no-files-found: error
+          retention-days: 14
