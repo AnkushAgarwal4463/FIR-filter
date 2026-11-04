@@ -1,4 +1,3 @@
-
 name: FIR Synthesis and Physical Design
 
 on:
@@ -8,9 +7,7 @@ on:
         description: "Choose full sweep or single configuration"
         required: true
         type: choice
-        options:
-          - sweep
-          - single
+        options: [sweep, single]
         default: sweep
       taps:
         description: "FIR taps (single mode)"
@@ -25,7 +22,7 @@ on:
         required: true
         default: "40"
       clock_period:
-        description: "Clock period (ns)"
+        description: "Clock period in ns (single mode)"
         required: true
         default: "10.0"
 
@@ -70,7 +67,7 @@ env:
   SINGLE_TAPS: ${{ inputs.taps || '8' }}
   SINGLE_DATA_WIDTH: ${{ inputs.data_width || '8' }}
   SINGLE_UTIL: ${{ inputs.utilization || '40' }}
-  CLK_PERIOD: ${{ inputs.clock_period || '10.0' }}
+  SINGLE_CLOCK_PERIOD: ${{ inputs.clock_period || '10.0' }}
 
 jobs:
   preflight:
@@ -80,6 +77,7 @@ jobs:
       image: openroad/orfs:latest
     outputs:
       configurations: ${{ steps.matrix.outputs.configurations }}
+      expected_count: ${{ steps.matrix.outputs.expected_count }}
 
     steps:
       - name: Check out repository
@@ -89,7 +87,6 @@ jobs:
         run: |
           set -euo pipefail
           test -f ../environment.yml
-
           files=(
             Makefile
             rtl/fir_filter.v
@@ -102,10 +99,9 @@ jobs:
             constraints/fir_filter.sdc.in
             config/sky130_example.env
           )
-
           for file in "${files[@]}"; do
-            test -f "$file" || {
-              echo "ERROR: Missing $file"
+            test -s "$file" || {
+              echo "ERROR: Missing or empty required file: $file"
               exit 1
             }
             echo "FOUND: $file"
@@ -124,73 +120,78 @@ jobs:
         run: |
           set -euo pipefail
           source /OpenROAD-flow-scripts/env.sh
-
           python --version
           yosys -V
           openroad -version
-
           bash -n scripts/run_fir_flow.sh
           python -m py_compile \
             scripts/extract_fir_features.py \
             scripts/combine_fir_results.py
-
           make sim
 
-      - name: Generate configuration matrix
+      - name: Generate configuration and clock-period matrix
         id: matrix
         env:
           MODE: ${{ env.RUN_MODE }}
           TAPS: ${{ env.SINGLE_TAPS }}
           DATA_WIDTH: ${{ env.SINGLE_DATA_WIDTH }}
           UTILIZATION: ${{ env.SINGLE_UTIL }}
+          SINGLE_CLOCK_PERIOD: ${{ env.SINGLE_CLOCK_PERIOD }}
         run: |
           set -euo pipefail
-
           python - <<'PY'
           import json
           import os
 
-          if os.environ["MODE"] == "single":
+          mode = os.environ["MODE"]
+          periods = (5.0, 7.5, 10.0, 12.5, 15.0)
+
+          if mode == "single":
+              selected_period = float(os.environ["SINGLE_CLOCK_PERIOD"])
+              if selected_period <= 0:
+                  raise SystemExit("Clock period must be greater than zero.")
               configs = [{
                   "taps": int(os.environ["TAPS"]),
                   "data_width": int(os.environ["DATA_WIDTH"]),
                   "utilization": int(os.environ["UTILIZATION"]),
+                  "clock_period": selected_period,
               }]
-          else:
+          elif mode == "sweep":
+              base = [
+                  (taps, width, util)
+                  for taps, widths in ((4, (8, 16)), (8, (8, 16)), (12, (8,)))
+                  for width in widths
+                  for util in (20, 30, 40, 50)
+              ]
+              if len(base) != 20:
+                  raise SystemExit(f"Internal matrix error: expected 20 base configs, got {len(base)}")
               configs = [
                   {
                       "taps": taps,
                       "data_width": width,
                       "utilization": util,
+                      "clock_period": period,
                   }
-                  for taps, widths in (
-                      (4, (8, 16)),
-                      (8, (8, 16)),
-                      (12, (8,))
-                  )
-                  for width in widths
-                  for util in (20, 30, 40, 50)
+                  for taps, width, util in base
+                  for period in periods
               ]
+          else:
+              raise SystemExit(f"Unsupported RUN_MODE: {mode}")
 
-          matrix_json = json.dumps(
-              {"include": configs},
-              separators=(",", ":")
-          )
+          matrix_json = json.dumps({"include": configs}, separators=(",", ":"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"configurations={matrix_json}\n")
+              out.write(f"expected_count={len(configs)}\n")
 
-          # Only valid key=value output goes into GITHUB_OUTPUT.
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"configurations={matrix_json}\n")
-
-          # This is ordinary console output, not a workflow output.
+          print(f"Run mode: {mode}")
+          print(f"Clock periods (ns): {', '.join(map(str, periods)) if mode == 'sweep' else selected_period}")
           print(f"Number of configurations: {len(configs)}")
-          print(f"Run mode: {os.environ['MODE']}")
           PY
 
   fir-physical-design:
     needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     container:
       image: openroad/orfs:latest
 
@@ -204,7 +205,7 @@ jobs:
       DATA_WIDTH: ${{ matrix.data_width }}
       COEFF_WIDTH: 8
       UTIL: ${{ matrix.utilization }}
-      CLK_PERIOD: ${{ inputs.clock_period || '10.0' }}
+      CLK_PERIOD: ${{ matrix.clock_period }}
 
     steps:
       - name: Check out repository
@@ -223,7 +224,6 @@ jobs:
         run: |
           set -euo pipefail
           source /OpenROAD-flow-scripts/env.sh
-
           ORFS_PLATFORM="/OpenROAD-flow-scripts/flow/platforms/sky130hd"
 
           export LIBERTY="$ORFS_PLATFORM/lib/sky130_fd_sc_hd__tt_025C_1v80.lib"
@@ -247,11 +247,8 @@ jobs:
         run: |
           set -euo pipefail
           source /OpenROAD-flow-scripts/env.sh
-
           chmod +x scripts/run_fir_flow.sh
-
           echo "Configuration: taps=$TAPS data_width=$DATA_WIDTH utilization=$UTIL clock_period=$CLK_PERIOD ns"
-
           ./scripts/run_fir_flow.sh
 
       - name: Record configuration status and failure diagnostics
@@ -274,63 +271,42 @@ jobs:
           coeff_width = int(os.environ["COEFF_WIDTH"])
           utilization = int(os.environ["UTIL"])
           clock = float(os.environ["CLK_PERIOD"])
-
           acc_width = data_width + coeff_width + 8
-
           run_id = (
               f"fir_t{taps}_dw{data_width}_cw{coeff_width}"
               f"_aw{acc_width}_u{utilization}_clk{clock:g}"
           )
-
           run_dir = Path("fir_project/runs") / run_id
           stage = "unknown"
 
           status_csv = run_dir / "fir_features_status.csv"
-
           if status_csv.is_file():
               try:
-                  with status_csv.open(
-                      newline="",
-                      encoding="utf-8-sig"
-                  ) as handle:
+                  with status_csv.open(newline="", encoding="utf-8-sig") as handle:
                       rows = list(csv.DictReader(handle))
-
                   if rows:
                       stage = rows[-1].get("last_completed_stage") or "unknown"
-
               except (OSError, csv.Error):
                   pass
 
           reason = ""
-
-          log_paths = (
+          for log_path in (
               run_dir / "openroad_log.txt",
               run_dir / "flow_diagnostics.log",
               run_dir / "synthesis.log",
-          )
-
-          for log_path in log_paths:
+          ):
               if not log_path.is_file():
                   continue
-
               try:
                   lines = log_path.read_text(
-                      encoding="utf-8",
-                      errors="replace"
+                      encoding="utf-8", errors="replace"
                   ).splitlines()
               except OSError:
                   continue
-
               matches = [
-                  line.strip()
-                  for line in lines
-                  if re.search(
-                      r"\b(ERROR|FATAL)\b|No access point",
-                      line,
-                      re.I
-                  )
+                  line.strip() for line in lines
+                  if re.search(r"\b(ERROR|FATAL)\b|No access point", line, re.I)
               ]
-
               if matches:
                   reason = matches[-1][-1000:]
                   break
@@ -342,22 +318,19 @@ jobs:
               "coeff_width": coeff_width,
               "acc_width": acc_width,
               "utilization": utilization,
-              "place_density": utilization / 100,
-              "clk_period_ns": clock,
+              "place_density": utilization / 100.0,
+              "clock_period": clock,
+              "clock_period_ns": clock,
+              "frequency_mhz": 1000.0 / clock,
               "job_outcome": os.environ.get("FLOW_OUTCOME", "unknown"),
               "last_completed_stage": stage,
               "failure_reason": reason,
           }
 
-          output_file = (
-              Path("fir_project/matrix-status") / f"{run_id}.json"
-          )
-
+          output_file = Path("fir_project/matrix-status") / f"{run_id}.json"
           output_file.write_text(
-              json.dumps(record, indent=2) + "\n",
-              encoding="utf-8"
+              json.dumps(record, indent=2) + "\n", encoding="utf-8"
           )
-
           print(json.dumps(record, indent=2))
           PY
 
@@ -365,7 +338,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fir-config-t${{ matrix.taps }}-dw${{ matrix.data_width }}-u${{ matrix.utilization }}
+          name: fir-config-t${{ matrix.taps }}-dw${{ matrix.data_width }}-u${{ matrix.utilization }}-clk${{ matrix.clock_period }}
           if-no-files-found: warn
           retention-days: 14
           path: |
@@ -392,17 +365,23 @@ jobs:
           if-no-artifact-found: ignore
 
       - name: Build combined CSV
+        env:
+          RUN_MODE: ${{ inputs.run_mode || 'sweep' }}
+          SINGLE_TAPS: ${{ inputs.taps || '8' }}
+          SINGLE_DATA_WIDTH: ${{ inputs.data_width || '8' }}
+          SINGLE_UTIL: ${{ inputs.utilization || '40' }}
+          SINGLE_CLOCK_PERIOD: ${{ inputs.clock_period || '10.0' }}
         run: |
           set -euo pipefail
-
-          if [ ! -d ../artifacts ]; then
-            echo "No configuration artifacts were downloaded."
-            exit 1
-          fi
-
           python3 scripts/combine_fir_results.py \
             --artifacts ../artifacts \
-            --output ../combined_fir_features.csv
+            --output ../combined_fir_features.csv \
+            --run-mode "$RUN_MODE" \
+            --single-taps "$SINGLE_TAPS" \
+            --single-data-width "$SINGLE_DATA_WIDTH" \
+            --single-utilization "$SINGLE_UTIL" \
+            --single-clock-period "$SINGLE_CLOCK_PERIOD" \
+            --clock-periods "5,7.5,10,12.5,15"
 
       - name: Upload combined CSV
         if: always()
