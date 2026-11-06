@@ -196,7 +196,7 @@ jobs:
       image: openroad/orfs:latest
 
     strategy:
-      fail-fast: false
+      fail-fast: true
       max-parallel: 5
       matrix: ${{ fromJSON(needs.preflight.outputs.configurations) }}
 
@@ -346,7 +346,7 @@ jobs:
             fir-filter-cross-design/fir_project/matrix-status/**
 
   combine-results:
-    if: ${{ always() }}
+    if: ${{ needs.preflight.result == 'success' && needs.fir-physical-design.result == 'success' }}
     needs:
       - preflight
       - fir-physical-design
