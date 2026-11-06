@@ -513,10 +513,15 @@ jobs:
       - name: Verify downloaded artifacts
         run: |
           set -euo pipefail
-
+      
           echo "Downloaded artifacts:"
-          find artifacts -type f | head -50
-
+          if [ -d artifacts ]; then
+            find artifacts -type f -print 2>/dev/null | sed -n '1,50p'
+          else
+            echo "ERROR: artifacts directory not found"
+            exit 1
+          fi
+      
           test -d artifacts
 
       - name: Build combined CSV
