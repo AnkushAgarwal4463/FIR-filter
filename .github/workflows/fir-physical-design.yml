@@ -72,6 +72,10 @@ env:
 
 jobs:
 
+  # --------------------------------------------------
+  # PREFLIGHT
+  # --------------------------------------------------
+
   preflight:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -142,7 +146,7 @@ jobs:
 
           make sim
 
-      - name: Generate 100 configuration matrix
+      - name: Generate configuration matrix
         id: matrix
         env:
           MODE: ${{ env.RUN_MODE }}
@@ -238,6 +242,10 @@ jobs:
           print(f"Number of configurations: {len(configs)}")
           PY
 
+  # --------------------------------------------------
+  # FIR PHYSICAL DESIGN MATRIX
+  # --------------------------------------------------
+
   fir-physical-design:
     needs: preflight
 
@@ -259,7 +267,7 @@ jobs:
       UTIL: ${{ matrix.utilization }}
       CLK_PERIOD: ${{ matrix.clock_period }}
 
-      # Diagnostic sweep: disable timing repair.
+      # Diagnostic sweep: timing repair disabled.
       ENABLE_REPAIR_TIMING: "0"
 
     steps:
@@ -476,6 +484,10 @@ jobs:
             fir-filter-cross-design/fir_project/runs/**
             fir-filter-cross-design/fir_project/matrix-status/**
 
+  # --------------------------------------------------
+  # COMBINE RESULTS
+  # --------------------------------------------------
+
   combine-results:
     needs:
       - preflight
@@ -494,9 +506,18 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: fir-config-*
-          path: artifacts
+          path: fir-filter-cross-design/artifacts
           merge-multiple: false
-          if-no-artifact-found: ignore
+          if-no-artifact-found: error
+
+      - name: Verify downloaded artifacts
+        run: |
+          set -euo pipefail
+
+          echo "Downloaded artifacts:"
+          find artifacts -type f | head -50
+
+          test -d artifacts
 
       - name: Build combined CSV
         env:
@@ -509,7 +530,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 fir-filter-cross-design/scripts/combine_fir_results.py \
+          test -s scripts/combine_fir_results.py
+
+          python3 scripts/combine_fir_results.py \
             --artifacts artifacts \
             --output combined_fir_features.csv \
             --run-mode "$RUN_MODE" \
@@ -519,10 +542,15 @@ jobs:
             --single-clock-period "$SINGLE_CLOCK_PERIOD" \
             --clock-periods "5,7.5,10,12.5,15"
 
+          test -s combined_fir_features.csv
+
+          echo "Combined FIR CSV generated successfully."
+          ls -lh combined_fir_features.csv
+
       - name: Upload combined CSV
         uses: actions/upload-artifact@v4
         with:
           name: fir-combined-results-${{ github.run_number }}
-          path: combined_fir_features.csv
+          path: fir-filter-cross-design/combined_fir_features.csv
           if-no-files-found: error
           retention-days: 14
