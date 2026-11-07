@@ -299,26 +299,7 @@ def extract_netlist_features(path: Path, requested_top: str, design_id: str) -> 
     liberty_path = configured_path("LIBERTY")
     liberty_directions = load_liberty_pin_directions(liberty_path)
     
-    # Temporary diagnostics: verify Liberty parsing and cell-name matching.
-    netlist_cell_types = {
-        str(cell.get("type", "")).lstrip("\\")
-        for cell in cells.values()
-    }
-
-    matched_types = netlist_cell_types & set(liberty_directions)
-
-    print("\n===== Liberty Fanout Diagnostics =====")
-    print(f"LIBERTY path: {liberty_path}")
-    print(
-        "LIBERTY file exists: "
-        f"{liberty_path.is_file() if liberty_path else False}"
-    )
-    print(f"Liberty cells parsed: {len(liberty_directions)}")
-    print(f"Unique netlist cell types: {len(netlist_cell_types)}")
-    print(f"Matching cell types: {len(matched_types)}")
-    print(f"Sample netlist cell types: {sorted(netlist_cell_types)[:10]}")
-    print(f"Sample Liberty cell types: {list(liberty_directions)[:10]}")
-    print("======================================\n")
+    # Keep extraction output concise; fanout coverage is recorded in the JSON/CSV.
 
     # Normalize names once so each netlist cell lookup is constant-time.
     liberty_by_name = {
@@ -492,90 +473,117 @@ def parse_def_routing(text: str) -> dict[str, Any]:
     return {"def_nets_section_found": True, "routed_net_count": routed, "route_segment_count": clauses}
 
 
-def parse_route_log(text: str, wirelength_text: str = "", drc_text: str = "") -> dict[str, Any]:
-    """Parse only explicit router-reported measurements; no DEF via-definition guesses."""
-    wire_sources = "\n".join(part for part in (wirelength_text, text) if part)
-    drc_sources = "\n".join(part for part in (drc_text, text) if part)
-    wire = last_number(wire_sources, [
-        rf"\bTotal\s+wire\s+length\s*[:=]\s*({NUM})\s*(?:um|µm)\b",
-        rf"\bTotal\s+wire\s+length\s*[:=]\s*({NUM})",
-        rf"\bwire\s+length\s*[:=]\s*({NUM})\s*(?:um|µm)\b",
-    ])
-    vias = last_number(text, [
-        rf"\bTotal\s+number\s+of\s+vias\s*[:=]\s*({NUM})",
-        rf"\bNumber\s+of\s+vias\s*[:=]\s*({NUM})",
-    ])
-    viol = last_number(drc_sources, [
-        rf"\bNumber\s+of\s+violations\s*[:=]\s*({NUM})",
-        rf"\bTotal\s+violations\s*[:=]\s*({NUM})",
-        rf"\bDRC\s+violations\s*[:=]\s*({NUM})",
-        rf"\bviolation\s+count\s*[:=]\s*({NUM})",
-    ])
-    return {
-        "wirelength_um": wire,
-        "via_count": int(vias) if vias is not None else None,
-        "final_detailed_route_violations": int(viol) if viol is not None else None,
-    }
+def parse_route_log(text: str) -> dict[str, Any]:
+    wire = last_number(text, [rf"\bTotal\s+wire\s+length\s*[:=]\s*({NUM})\s*(?:um|µm)\b", rf"\bTotal\s+wire\s+length\s*[:=]\s*({NUM})"])
+    vias = last_number(text, [rf"\bTotal\s+number\s+of\s+vias\s*[:=]\s*({NUM})", rf"\bNumber\s+of\s+vias\s*[:=]\s*({NUM})"])
+    viol = last_number(text, [rf"\bNumber\s+of\s+violations\s*[:=]\s*({NUM})", rf"\bTotal\s+violations\s*[:=]\s*({NUM})"])
+    return {"wirelength_um": wire, "via_count": int(vias) if vias is not None else None, "final_detailed_route_violations": int(viol) if viol is not None else None}
 
 
 
 
-def parse_congestion(text: str) -> float | None:
-    """Extract a numeric routing-overflow value only when explicitly reported.
+def parse_congestion_metrics(text: str) -> dict[str, float | None]:
+    """Parse explicit global-routing overflow metrics from one GRT source.
 
-    A Boolean congestion status is not treated as a numeric overflow value.
+    The final Total row in OpenROAD's congestion table contains the maximum
+    horizontal, maximum vertical, and total overflow values. A Boolean status
+    or a generic mention of congestion is never converted into a numeric zero.
     """
+    result: dict[str, float | None] = {
+        "congestion_max_horizontal_overflow": None,
+        "congestion_max_vertical_overflow": None,
+        "congestion_overflow": None,
+    }
     if not text or not text.strip():
-        return None
+        return result
 
-    # OpenROAD global_route -verbose prints a per-layer table whose last
-    # column is "Max H / Max V / Total Overflow". Use the last "Total" row.
-    grt_total = re.findall(
+    # OpenROAD verbose GRT table: Total <...> <...>% <max-H> / <max-V> / <total>.
+    table_rows = re.findall(
         rf"(?im)^\s*Total\s+{NUM}\s+{NUM}\s+{NUM}%\s+({NUM})\s*/\s*({NUM})\s*/\s*({NUM})\s*$",
         text,
     )
-    if grt_total:
-        return float(grt_total[-1][2])
+    if table_rows:
+        h, v, total = table_rows[-1]
+        result.update({
+            "congestion_max_horizontal_overflow": finite_float(h),
+            "congestion_max_vertical_overflow": finite_float(v),
+            "congestion_overflow": finite_float(total),
+        })
+        return result
 
-    patterns = [
-        rf"(?im)^\s*total\s+(?:routing\s+)?overflow\s*[:=]\s*({NUM})\b",
-        rf"(?im)^\s*(?:(?:global|detailed)\s+)?routing\s+overflow\s*[:=]\s*({NUM})\b",
-        rf"(?im)^\s*congestion\s+overflow\s*[:=]\s*({NUM})\b",
-        rf"(?im)^.*?\btotal\s+overflow\s+(?:is|of)\s+({NUM})\b",
-        rf"(?im)^.*?\b(?:global\s+)?routing\s+overflow\s+(?:is|of)\s+({NUM})\b",
-        rf"(?im)^.*?\bcongestion\s+overflow\s+(?:is|of)\s+({NUM})\b",
-    ]
+    # Some flow scripts write named scalar values to a dedicated GRT report.
+    named_patterns = {
+        "congestion_max_horizontal_overflow": [
+            rf"(?im)^\s*(?:max(?:imum)?\s+)?horizontal\s+(?:routing\s+)?overflow\s*[:=]\s*({NUM})\s*$",
+            rf"(?im)^\s*max\s+H\s+overflow\s*[:=]\s*({NUM})\s*$",
+        ],
+        "congestion_max_vertical_overflow": [
+            rf"(?im)^\s*(?:max(?:imum)?\s+)?vertical\s+(?:routing\s+)?overflow\s*[:=]\s*({NUM})\s*$",
+            rf"(?im)^\s*max\s+V\s+overflow\s*[:=]\s*({NUM})\s*$",
+        ],
+        "congestion_overflow": [
+            rf"(?im)^\s*(?:total\s+)?(?:global\s+)?routing\s+overflow\s*[:=]\s*({NUM})\s*$",
+            rf"(?im)^\s*total\s+congestion\s+overflow\s*[:=]\s*({NUM})\s*$",
+            rf"(?im)^\s*total\s+overflow\s*[:=]\s*({NUM})\s*$",
+        ],
+    }
+    for key, patterns in named_patterns.items():
+        result[key] = last_number(text, patterns)
 
-    value = last_number(text, patterns)
-    if value is not None:
-        return value
+    return result
 
-    explicit_zero_patterns = [
-        r"\bno\s+overflowing\s+gcells?\b",
-        r"\bzero\s+routing\s+overflow\b",
-        r"\btotal\s+overflow\s*[:=]\s*0(?:\.0*)?(?![\d.eE])",
-        r"\btotal\s+overflow\s+(?:is|of)\s+0(?:\.0*)?(?![\d.eE])",
-    ]
 
-    if any(re.search(pattern, text, re.I) for pattern in explicit_zero_patterns):
-        return 0.0
-
-    return None
+def parse_congestion(text: str) -> float | None:
+    """Backward-compatible accessor for the total GRT overflow only."""
+    return parse_congestion_metrics(text)["congestion_overflow"]
 
 
 def parse_congestion_status(text: str) -> str | None:
-    """Read an explicitly recorded global-routing congestion status."""
+    """Read only an explicitly written global-route Boolean status."""
     if not text:
         return None
-
     match = re.search(
-        r"(?im)^\s*GLOBAL_ROUTE_HAS_CONGESTION:\s*(true|false|0|1)\b",
+        r"(?im)^\s*GLOBAL_ROUTE_HAS_CONGESTION:\s*(true|false|0|1)\s*$",
         text,
     )
     if not match:
         return None
-
     return "yes" if match.group(1).lower() in {"true", "1"} else "no"
+
+
+def find_global_route_source(run_dir: Path, logs: dict[str, str]) -> tuple[str | None, str, dict[str, float | None]]:
+    """Select a named GRT report/log; never parse an arbitrary combined log."""
+    report_names = (
+        "global_route_congestion.rpt", "grt_congestion.rpt",
+        "congestion.rpt", "routing_congestion.rpt",
+    )
+    for wanted in report_names:
+        candidates = [run_dir / wanted, *sorted(run_dir.rglob(wanted))]
+        for path in candidates:
+            if not path.is_file():
+                continue
+            content = read_text(path)
+            metrics = parse_congestion_metrics(content)
+            if metrics["congestion_overflow"] is not None:
+                return str(path), content, metrics
+
+    # Only stage-specific global-routing logs are eligible for numeric parsing.
+    grt_names = {
+        "5_1_grt.log", "global_route.log", "global_routing.log",
+        "global_route_congestion.log", "grt.log",
+    }
+    for name, content in logs.items():
+        if Path(name).name.lower() not in grt_names:
+            continue
+        metrics = parse_congestion_metrics(content)
+        if metrics["congestion_overflow"] is not None:
+            return name, content, metrics
+
+    return None, "", {
+        "congestion_max_horizontal_overflow": None,
+        "congestion_max_vertical_overflow": None,
+        "congestion_overflow": None,
+    }
 
 
 def parse_physical_log_values(text: str) -> dict[str, Any]:
@@ -636,82 +644,124 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
     if not run_dir.is_dir():
         raise FileNotFoundError(f"Run directory not found: {run_dir}")
 
-    final_def_path = run_dir / "final.def"
-    final_odb_path = run_dir / "final.odb"
-    pre_drt_def_path = run_dir / "pre_drt.def"
-    pre_drt_odb_path = run_dir / "pre_drt.odb"
+    def_path = run_dir / "final.def"
+    odb_path = run_dir / "final.odb"
+    def_text = read_text(def_path)
 
-    final_def_ok = final_def_path.is_file() and final_def_path.stat().st_size > 0
-    final_odb_ok = final_odb_path.is_file() and final_odb_path.stat().st_size > 0
-    pre_drt_def_ok = pre_drt_def_path.is_file() and pre_drt_def_path.stat().st_size > 0
-    pre_drt_odb_ok = pre_drt_odb_path.is_file() and pre_drt_odb_path.stat().st_size > 0
+    # Find reports containing the specific timing metric.
+    setup_path, setup_text = find_report(
+        run_dir,
+        [
+            "wns_setup.rpt",
+            "timing_setup.rpt",
+            "wns_setup_global_route.rpt",
+            "timing_setup_global_route.rpt",
+            "setup_timing.rpt",
+            "setup.rpt",
+        ],
+        metric="wns_setup_ns",
+    )
 
-    # Keep useful placement/global-route data when detailed routing fails.
-    if final_def_ok:
-        geometry_path = final_def_path
-        geometry_stage = "post_detailed_route"
-    elif pre_drt_def_ok:
-        geometry_path = pre_drt_def_path
-        geometry_stage = "pre_detailed_route_global_route_checkpoint"
-    else:
-        geometry_path = None
-        geometry_stage = "unavailable"
-    def_text = read_text(geometry_path) if geometry_path else ""
+    tns_path, tns_text = find_report(
+        run_dir,
+        [
+            "tns_setup.rpt",
+            "tns_setup_global_route.rpt",
+            "timing_setup.rpt",
+            "timing_setup_global_route.rpt",
+            "setup_timing.rpt",
+            "setup.rpt",
+        ],
+        metric="tns_setup_ns",
+    )
 
-    setup_path, setup_text = find_report(run_dir, [
-        "wns_setup.rpt", "timing_setup.rpt",
-        "wns_setup_global_route.rpt", "timing_setup_global_route.rpt",
-        "setup_timing.rpt", "setup.rpt",
-    ], metric="wns_setup_ns")
-    tns_path, tns_text = find_report(run_dir, [
-        "tns_setup.rpt", "tns_setup_global_route.rpt",
-        "timing_setup.rpt", "timing_setup_global_route.rpt",
-        "setup_timing.rpt", "setup.rpt",
-    ], metric="tns_setup_ns")
-    hold_path, hold_text = find_report(run_dir, [
-        "wns_hold.rpt", "timing_hold.rpt", "wns_hold_global_route.rpt",
-        "hold_timing.rpt", "hold.rpt",
-    ], metric="wns_hold_ns")
+    hold_path, hold_text = find_report(
+        run_dir,
+        [
+            "wns_hold.rpt",
+            "timing_hold.rpt",
+            "wns_hold_global_route.rpt",
+            "hold_timing.rpt",
+            "hold.rpt",
+        ],
+        metric="wns_hold_ns",
+    )
 
-    cong_path, cong_text = find_report(run_dir, [
-        "congestion_overflow.rpt", "congestion.rpt", "congestion_detail.rpt",
-        "global_route_congestion.rpt", "routing_congestion.rpt", "grt_congestion.rpt",
-    ])
-    area_path, area_text = find_report(run_dir, ["design_area.rpt", "area.rpt"])
-    wire_path, wire_text = find_report(run_dir, [
-        "wirelength_detailed.rpt", "wirelength_global.rpt", "wirelength.rpt",
-    ])
-    drc_path, drc_text = find_report(run_dir, [
-        "detailed_route_drc.rpt", "output_drc.rpt", "route_drc.rpt",
-    ])
+    # Congestion is selected later from a dedicated GRT report/log only.
 
+    area_path, area_text = find_report(
+        run_dir,
+        ["design_area.rpt", "area.rpt"],
+    )
+
+    # Collect logs for fallback measurements.
     logs = collect_logs(run_dir)
     route_name, route_text = choose_routing_log(logs)
     all_logs = "\n".join(logs.values())
 
-    congestion_status = parse_congestion_status("\n".join([cong_text, all_logs]))
+    # Numeric congestion must come from a dedicated global-routing source.
+    congestion_source, congestion_text, congestion_metrics = find_global_route_source(run_dir, logs)
+    # The Tcl status report is a Boolean only; do not use detailed-route or
+    # unrelated logs to infer global-route status.
+    status_path = run_dir / "congestion_overflow.rpt"
+    congestion_status = parse_congestion_status(read_text(status_path))
+    if congestion_status is None:
+        congestion_status = parse_congestion_status(congestion_text)
+    congestion = congestion_metrics["congestion_overflow"]
+
+    # Parse each timing metric independently.
+    # Do not use one generic timing parser for setup and hold.
     wns_setup = parse_timing_metric(setup_text, "wns_setup_ns")
     tns_setup = parse_timing_metric(tns_text, "tns_setup_ns")
     wns_hold = parse_timing_metric(hold_text, "wns_hold_ns")
+
+    # If a report exists but contains no parseable value, try the logs.
     if wns_setup is None:
         wns_setup = parse_timing_metric(all_logs, "wns_setup_ns")
-        if wns_setup is not None: setup_path = None
+        if wns_setup is not None:
+            setup_path = None
+
     if tns_setup is None:
         tns_setup = parse_timing_metric(all_logs, "tns_setup_ns")
-        if tns_setup is not None: tns_path = None
+        if tns_setup is not None:
+            tns_path = None
+
     if wns_hold is None:
         wns_hold = parse_timing_metric(all_logs, "wns_hold_ns")
-        if wns_hold is not None: hold_path = None
+        if wns_hold is not None:
+            hold_path = None
 
-    congestion = parse_congestion(cong_text) if cong_text else None
-    congestion_source = str(cong_path) if congestion is not None and cong_path else None
-    if congestion is None:
-        congestion = parse_congestion(all_logs)
-        if congestion is not None: congestion_source = "logs"
+    # Record the source actually used for each timing measurement.
+    setup_src = (
+        str(setup_path)
+        if setup_path is not None and wns_setup is not None
+        else "logs" if wns_setup is not None
+        else None
+    )
 
-    route = parse_route_log(route_text, wire_text, drc_text)
+    tns_src = (
+        str(tns_path)
+        if tns_path is not None and tns_setup is not None
+        else "logs" if tns_setup is not None
+        else None
+    )
+
+    hold_src = (
+        str(hold_path)
+        if hold_path is not None and wns_hold is not None
+        else "logs" if wns_hold is not None
+        else None
+    )
+
+    # Extract routing metrics from the selected routing log.
+    route = parse_route_log(route_text)
+
+
     physical = parse_physical_log_values("\n".join([area_text, all_logs]))
-    density_measurement = measure_density_from_def(def_text, configured_path("CELL_LEF"))
+    lef_path = configured_path("CELL_LEF")
+    density_measurement = measure_density_from_def(def_text, lef_path)
+    # Prefer a density reconstructed from final placement geometry. Otherwise use
+    # an explicit achieved/effective density message, never the target argument.
     if density_measurement.get("effective_place_density") is None and physical.get("effective_place_density") is not None:
         density_measurement = {
             **density_measurement,
@@ -725,13 +775,17 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
     route_success = bool(re.search(
         r"SUCCESS:\s*Detailed routing|Complete detail routing|Detailed routing completed",
         all_logs, re.I
-    )) and final_def_ok and final_odb_ok
+    ))
+    def_ok = def_path.is_file() and def_path.stat().st_size > 0
+    odb_ok = odb_path.is_file() and odb_path.stat().st_size > 0
 
     measurements = {
         "wns_setup_ns": "measured" if wns_setup is not None else "unavailable",
         "tns_setup_ns": "measured" if tns_setup is not None else "unavailable",
         "wns_hold_ns": "measured" if wns_hold is not None else "unavailable",
         "congestion_overflow": "measured" if congestion is not None else "unavailable",
+        "congestion_max_horizontal_overflow": "measured" if congestion_metrics["congestion_max_horizontal_overflow"] is not None else "unavailable",
+        "congestion_max_vertical_overflow": "measured" if congestion_metrics["congestion_max_vertical_overflow"] is not None else "unavailable",
         "congestion_status": "measured" if congestion_status is not None else "unavailable",
         "wirelength_um": "measured" if route["wirelength_um"] is not None else "unavailable",
         "via_count": "measured" if route["via_count"] is not None else "unavailable",
@@ -739,16 +793,12 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "design_area_um2": "measured" if physical["design_area_um2"] is not None else "unavailable",
         "effective_place_density": "measured" if density_measurement["effective_place_density"] is not None else "unavailable",
     }
+
     return {
-        "final_def_available": final_def_ok,
-        "final_odb_available": final_odb_ok,
-        "pre_drt_def_available": pre_drt_def_ok,
-        "pre_drt_odb_available": pre_drt_odb_ok,
-        "geometry_source_def": str(geometry_path) if geometry_path else None,
-        "geometry_stage": geometry_stage,
-        "final_def_nonempty": bool(read_text(final_def_path).strip()) if final_def_ok else False,
-        "artifacts_present": final_def_ok and final_odb_ok,
-        "pre_drt_checkpoint_present": pre_drt_def_ok and pre_drt_odb_ok,
+        "final_def_available": def_path.is_file(),
+        "final_odb_available": odb_path.is_file(),
+        "final_def_nonempty": bool(def_text.strip()),
+        "artifacts_present": def_ok and odb_ok,
         "detailed_route_success_marker_found": route_success,
         **def_counts,
         **route,
@@ -757,25 +807,28 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "placement_row_area_um2": density_measurement.get("placement_row_area_um2"),
         "effective_place_density_method": density_measurement.get("effective_place_density_method"),
         "design_area_um2": physical["design_area_um2"],
-        "wns_setup_ns": wns_setup, "tns_setup_ns": tns_setup, "wns_hold_ns": wns_hold,
-        "congestion_overflow": congestion, "congestion_status": congestion_status,
-        "setup_report_source": str(setup_path) if setup_path else ("logs" if wns_setup is not None else None),
-        "tns_report_source": str(tns_path) if tns_path else ("logs" if tns_setup is not None else None),
-        "hold_report_source": str(hold_path) if hold_path else ("logs" if wns_hold is not None else None),
+        "wns_setup_ns": wns_setup,
+        "tns_setup_ns": tns_setup,
+        "wns_hold_ns": wns_hold,
+        "congestion_overflow": congestion,
+        "congestion_max_horizontal_overflow": congestion_metrics["congestion_max_horizontal_overflow"],
+        "congestion_max_vertical_overflow": congestion_metrics["congestion_max_vertical_overflow"],
+        "congestion_status": congestion_status,
+        "setup_report_source": str(setup_path) if setup_path else ("logs" if setup_src else None),
+        "tns_report_source": str(tns_path) if tns_path else ("logs" if tns_src else None),
+        "hold_report_source": str(hold_path) if hold_path else ("logs" if hold_src else None),
         "congestion_report_source": congestion_source,
-        "wirelength_report_source": str(wire_path) if wire_path else (route_name if route["wirelength_um"] is not None else None),
-        "drc_report_source": str(drc_path) if drc_path else (route_name if route["final_detailed_route_violations"] is not None else None),
         "routing_log_source": route_name,
         "log_files_found": list(logs),
         "target_measurement_status": measurements,
         "note": (
-            "Pre-DRT DEF is used as a placement/global-route checkpoint when final DEF is absent; "
-            "its geometry is not a detailed-route result. Detailed-route wirelength/DRC/via metrics "
-            "are reported only when an explicit router report/log value is parsed. Congestion boolean "
-            "is not numeric overflow. DEF route counts are approximate. Cell classes are heuristic. "
-            "Effective density is reconstructed from placed LEF macro area / DEF placement-row area."
+            "DEF route counts are approximate. Cell classes are heuristic and should be validated against Liberty. "
+            "Fanout uses Yosys directions with Liberty fallback. Congestion is extracted only from a dedicated "
+            "global-routing report/log; missing overflow is unavailable, not zero, and H/V maxima are kept separately. "
+            "Effective density is measured from placed LEF macro "
+            "area divided by DEF placement-row area when geometry is available. Router violations are not independent signoff DRC."
         ),
-        "target_feature_stage": "post-placement/global-route or detailed-route target; check geometry_stage and source fields; exclude target leakage from predictors",
+        "target_feature_stage": "post-placement/routing targets; exclude these outcomes from predictors when predicting the same outcomes",
     }
 
 
@@ -811,8 +864,9 @@ def write_configuration_csv(outdir: Path, run_dir: Path, args: argparse.Namespac
     def_ok = bool(post["final_def_available"] and post["final_def_nonempty"])
     odb_ok = bool(post["final_odb_available"])
     route_success = bool(post["detailed_route_success_marker_found"])
-
+    # Read the Tcl stage-history record before using its status below.
     tcl_status, tcl_stage = read_tcl_status(run_dir)
+
     if tcl_status == "completed" and def_ok and odb_ok:
         flow_status, last_stage = "completed", tcl_stage or "flow_completed"
     elif tcl_status == "failed":
@@ -874,8 +928,10 @@ DISPLAY_NAMES = {
     "design_area_um2": "Design area (µm²)",
     "wns_setup_ns": "Setup WNS (ns)", "tns_setup_ns": "Setup TNS (ns)",
     "wns_hold_ns": "Hold WNS (ns)",
-    "congestion_overflow": "Congestion overflow",
-    "congestion_status": "Routing congestion status",
+    "congestion_overflow": "Global-route total overflow",
+    "congestion_max_horizontal_overflow": "Global-route max horizontal overflow",
+    "congestion_max_vertical_overflow": "Global-route max vertical overflow",
+    "congestion_status": "Global-route congestion status",
     "setup_report_source": "Setup timing report source", "tns_report_source": "TNS report source",
     "hold_report_source": "Hold timing report source", "congestion_report_source": "Congestion report source",
     "routing_log_source": "Routing log source", "note": "Notes / limitations",
@@ -915,7 +971,7 @@ def write_human_report(outdir: Path, pre: dict[str, Any], post: dict[str, Any], 
     """Write a compact Markdown report with one metric per row."""
     run_id = args.run_id or run_dir.name
     config = [
-        ("Run ID", run_id), ("Design ID", args.design_id), ("Top module", args.top),
+        ("Run ID", run_id), ("Design ID", args.design_id), ("Top module", pre.get("top_module", args.top)),
         ("FIR taps", args.taps), ("Data width (bits)", args.data_width),
         ("Coefficient width (bits)", args.coeff_width), ("Accumulator width (bits)", args.acc_width),
         ("Utilization constraint (%)", args.utilization), ("Placement density", args.place_density),
@@ -923,7 +979,6 @@ def write_human_report(outdir: Path, pre: dict[str, Any], post: dict[str, Any], 
     ]
     tcl_status, tcl_stage = read_tcl_status(run_dir)
     config.extend([("Flow status", tcl_status or "derived from artifacts/logs"), ("Last completed stage", tcl_stage or "derived from artifacts/logs")])
-    tcl_status, tcl_stage = read_tcl_status(run_dir)
     if tcl_status == "completed" and post.get("artifacts_present"):
         flow_status = "completed"
     elif tcl_status == "failed":
@@ -939,7 +994,8 @@ def write_human_report(outdir: Path, pre: dict[str, Any], post: dict[str, Any], 
         "detailed_route_success_marker_found", "routed_net_count", "route_segment_count", "wirelength_um",
         "via_count", "final_detailed_route_violations", "effective_place_density",
         "effective_place_density_method", "placed_cell_area_from_def_um2", "placement_row_area_um2",
-        "design_area_um2", "wns_setup_ns", "tns_setup_ns", "wns_hold_ns", "congestion_overflow", "congestion_status",
+        "design_area_um2", "wns_setup_ns", "tns_setup_ns", "wns_hold_ns", "congestion_overflow",
+        "congestion_max_horizontal_overflow", "congestion_max_vertical_overflow", "congestion_status",
     ]
     synthesis_keys = [
         "cell_count", "netname_count", "port_count", "port_bit_count", "sequential_cell_count",
@@ -991,7 +1047,7 @@ def write_excel_workbook(outdir: Path, pre: dict[str, Any], post: dict[str, Any]
     config_ws = workbook.active
     config_ws.title = "Configuration"
     config = {
-        "Run ID": args.run_id or run_dir.name, "Design ID": args.design_id, "Top module": args.top,
+        "Run ID": args.run_id or run_dir.name, "Design ID": args.design_id, "Top module": pre.get("top_module", args.top),
         "Netlist JSON": str(Path(args.netlist_json)), "Run directory": str(run_dir),
         "FIR taps": args.taps, "Data width (bits)": args.data_width,
         "Coefficient width (bits)": args.coeff_width, "Accumulator width (bits)": args.acc_width,
@@ -1045,49 +1101,192 @@ def write_excel_workbook(outdir: Path, pre: dict[str, Any], post: dict[str, Any]
     workbook.save(outdir / "fir_feature_report.xlsx")
     return True
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Extract FIR netlist features and OpenROAD physical targets.")
-    parser.add_argument("--netlist-json", default="fir_project/synth/fir_filter_netlist.json")
-    parser.add_argument("--run-dir", default="fir_project/runs/fir_8tap_w8_util40_clk10")
-    parser.add_argument("--outdir", default=None); parser.add_argument("--top", default="fir_filter")
-    parser.add_argument("--design-id", default="fir_filter_8tap"); parser.add_argument("--run-id", default=None)
-    parser.add_argument("--taps", type=int, default=None); parser.add_argument("--data-width", type=int, default=None)
-    parser.add_argument("--coeff-width", type=int, default=None); parser.add_argument("--acc-width", type=int, default=None)
-    parser.add_argument("--utilization", type=float, default=None); parser.add_argument("--place-density", type=float, default=None)
-    parser.add_argument("--clock-period", type=float, default=None)
-    parser.add_argument("--flow-status", default=None, help="Deprecated; detected status is used instead")
-    args = parser.parse_args(); run_dir = Path(args.run_dir); outdir = Path(args.outdir) if args.outdir else run_dir; netlist_path = Path(args.netlist_json)
-    if args.utilization is not None and not (0 < args.utilization <= 100): parser.error("--utilization must be > 0 and <= 100.")
-    if args.place_density is not None and not (0 < args.place_density <= 1): parser.error("--place-density must be > 0 and <= 1.")
-    if args.clock_period is not None and args.clock_period <= 0: parser.error("--clock-period must be positive.")
-    for name in ("taps", "data_width", "coeff_width", "acc_width"):
-        value = getattr(args, name)
-        if value is not None and value <= 0: parser.error(f"--{name.replace('_', '-')} must be positive.")
+
+def validate_configuration(args: argparse.Namespace, run_dir: Path, netlist_path: Path) -> dict[str, Any] | None:
+    """Validate CLI metadata against the run manifest written by run_fir_flow.sh."""
+    manifest_path = run_dir / "configuration.json"
+    if not manifest_path.is_file():
+        print(f"WARNING: configuration manifest not found: {manifest_path}", file=sys.stderr)
+        return None
     try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read configuration manifest {manifest_path}: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("configuration.json must contain a JSON object.")
+
+    expected = {
+        "run_id": args.run_id or run_dir.name,
+        "design_id": args.design_id,
+        "top": args.top,
+        "taps": args.taps,
+        "data_width": args.data_width,
+        "coeff_width": args.coeff_width,
+        "acc_width": args.acc_width,
+        "utilization": args.utilization,
+        "place_density": args.place_density,
+        "clock_period_ns": args.clock_period,
+    }
+    for key, supplied in expected.items():
+        if key not in manifest:
+            continue
+        actual = manifest[key]
+        if isinstance(supplied, (int, float)) and not isinstance(supplied, bool):
+            try:
+                matches = abs(float(actual) - float(supplied)) <= 1e-9
+            except (TypeError, ValueError):
+                matches = False
+        else:
+            matches = str(actual) == str(supplied)
+        if not matches:
+            raise ValueError(
+                f"Configuration mismatch for '{key}': CLI supplied {supplied!r}, "
+                f"but configuration.json contains {actual!r}."
+            )
+
+    manifest_netlist = manifest.get("netlist_json")
+    if manifest_netlist:
+        recorded = Path(str(manifest_netlist))
+        if not recorded.is_absolute():
+            recorded = Path.cwd() / recorded
+        supplied_path = netlist_path if netlist_path.is_absolute() else Path.cwd() / netlist_path
+        if recorded.resolve() != supplied_path.resolve():
+            raise ValueError(
+                f"Netlist path mismatch: CLI supplied '{netlist_path}', "
+                f"manifest records '{manifest_netlist}'."
+            )
+    return manifest
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Extract FIR netlist features and OpenROAD physical targets."
+    )
+    parser.add_argument("--netlist-json", required=True, help="Unique Yosys JSON netlist for this configuration")
+    parser.add_argument("--run-dir", required=True, help="OpenROAD run directory for this configuration")
+    parser.add_argument("--outdir", default=None, help="Output directory; defaults to --run-dir")
+    parser.add_argument("--top", default="fir_filter")
+    parser.add_argument("--design-id", default="fir_filter")
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--taps", type=int, required=True)
+    parser.add_argument("--data-width", type=int, required=True)
+    parser.add_argument("--coeff-width", type=int, required=True)
+    parser.add_argument("--acc-width", type=int, required=True)
+    parser.add_argument("--utilization", type=float, required=True)
+    parser.add_argument("--place-density", type=float, required=True)
+    parser.add_argument("--clock-period", type=float, required=True)
+    parser.add_argument(
+        "--flow-status", default=None,
+        help="Deprecated; flow status is detected from artifacts and status CSV."
+    )
+    args = parser.parse_args()
+
+    run_dir = Path(args.run_dir)
+    outdir = Path(args.outdir) if args.outdir else run_dir
+    netlist_path = Path(args.netlist_json)
+
+    if args.taps not in {4, 8, 12}:
+        parser.error("--taps must be one of: 4, 8, 12.")
+    if args.data_width not in {8, 16}:
+        parser.error("--data-width must be one of: 8, 16.")
+    if args.coeff_width != 8:
+        parser.error("--coeff-width must be 8 for the current FIR coefficient table.")
+    if args.acc_width != args.data_width + args.coeff_width + 8:
+        parser.error(
+            "--acc-width must equal data-width + coeff-width + 8 "
+            "for the current FIR flow policy."
+        )
+    if not (0 < args.utilization <= 100):
+        parser.error("--utilization must be > 0 and <= 100.")
+    if not (0 < args.place_density <= 1):
+        parser.error("--place-density must be > 0 and <= 1.")
+    if args.clock_period <= 0:
+        parser.error("--clock-period must be positive.")
+    if not args.run_id.strip():
+        parser.error("--run-id cannot be empty.")
+
+    try:
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"Run directory not found: {run_dir}")
+        if not netlist_path.is_file():
+            raise FileNotFoundError(f"Netlist JSON not found: {netlist_path}")
+
+        manifest = validate_configuration(args, run_dir, netlist_path)
         outdir.mkdir(parents=True, exist_ok=True)
+
         pre = extract_netlist_features(netlist_path, args.top, args.design_id)
-        pre["utilization_constraint_percent"] = args.utilization; pre["clock_period_ns"] = args.clock_period
+        # These are known before placement and can be retained as conditioning inputs.
+        pre["utilization_constraint_percent"] = args.utilization
+        pre["clock_period_ns"] = args.clock_period
+
         post = physical_features(run_dir)
-        write_json(outdir / "preplacement_features.json", pre); write_csv(outdir / "preplacement_features.csv", pre)
-        write_json(outdir / "physical_targets.json", post); write_csv(outdir / "physical_targets.csv", post)
-        combined = {**pre, **post}; write_json(outdir / "features.json", combined); write_csv(outdir / "features.csv", combined)
+        write_json(outdir / "preplacement_features.json", pre)
+        write_csv(outdir / "preplacement_features.csv", pre)
+        write_json(outdir / "physical_targets.json", post)
+        write_csv(outdir / "physical_targets.csv", post)
+
+        combined = {**pre, **post}
+        write_json(outdir / "features.json", combined)
+        write_csv(outdir / "features.csv", combined)
+
         write_configuration_csv(outdir, run_dir, args, post)
         write_human_report(outdir, pre, post, args, run_dir)
         xlsx_created = write_excel_workbook(outdir, pre, post, combined, args, run_dir)
-        status = {"design_id": args.design_id, "run_id": args.run_id or run_dir.name, "netlist_json": str(netlist_path), "run_dir": str(run_dir), "output_dir": str(outdir), "fanout_direction_metadata_found": pre["fanout_direction_metadata_found"], "final_def_available": post["final_def_available"], "final_odb_available": post["final_odb_available"], "artifacts_present": post["artifacts_present"], "detailed_route_success_marker_found": post["detailed_route_success_marker_found"], "target_measurement_status": post["target_measurement_status"], "markdown_report_created": True, "excel_workbook_created": xlsx_created}
+
+        status = {
+            "extraction_success": True,
+            "design_id": args.design_id,
+            "run_id": args.run_id,
+            "top_module": pre.get("top_module"),
+            "netlist_json": str(netlist_path),
+            "run_dir": str(run_dir),
+            "output_dir": str(outdir),
+            "configuration_manifest_found": manifest is not None,
+            "fanout_direction_metadata_found": pre["fanout_direction_metadata_found"],
+            "fanout_metadata_complete_for_all_cells": pre["fanout_metadata_complete_for_all_cells"],
+            "final_def_available": post["final_def_available"],
+            "final_odb_available": post["final_odb_available"],
+            "artifacts_present": post["artifacts_present"],
+            "detailed_route_success_marker_found": post["detailed_route_success_marker_found"],
+            "target_measurement_status": post["target_measurement_status"],
+            "markdown_report_created": True,
+            "excel_workbook_created": xlsx_created,
+        }
         write_json(outdir / "extraction_status.json", status)
-    except (OSError, ValueError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr); return 1
+
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
     print("\n===== FIR Feature Extraction =====")
-    print(f"Run directory : {run_dir}\nOutput directory: {outdir}\nCell count    : {pre['cell_count']}\nSequential    : {pre['sequential_cell_count']}\nCombinational : {pre['combinational_cell_count']}\nFanout method : {pre['fanout_method']}\nFinal DEF     : {post['final_def_available']}\nFinal ODB     : {post['final_odb_available']}\nRouting success marker: {post['detailed_route_success_marker_found']}")
-    print("\n===== Physical Targets =====")
-    for key in ("wns_setup_ns", "tns_setup_ns", "wns_hold_ns", "congestion_overflow", "wirelength_um", "via_count", "final_detailed_route_violations", "design_area_um2", "effective_place_density"):
+    print(f"Run ID        : {args.run_id}")
+    print(f"Run directory : {run_dir}")
+    print(f"Output directory: {outdir}")
+    print(f"Top module    : {pre['top_module']}")
+    print(f"Cell count    : {pre['cell_count']}")
+    print(f"Sequential    : {pre['sequential_cell_count']}")
+    print(f"Combinational : {pre['combinational_cell_count']}")
+    print(f"Fanout method : {pre['fanout_method']}")
+    print(f"Final DEF     : {post['final_def_available']}")
+    print(f"Final ODB     : {post['final_odb_available']}")
+    print(f"Routing success marker: {post['detailed_route_success_marker_found']}")
+
+    print("===== Physical Targets =====")
+    for key in (
+        "wns_setup_ns", "tns_setup_ns", "wns_hold_ns", "congestion_overflow",
+        "congestion_max_horizontal_overflow", "congestion_max_vertical_overflow",
+        "wirelength_um", "via_count", "final_detailed_route_violations",
+        "design_area_um2", "effective_place_density",
+    ):
         print(f"{key}: {post.get(key)}")
-    print("\n===== Target Status =====")
-    for key, value in post["target_measurement_status"].items(): print(f"{key}: {value}")
-    print("\nGenerated: preplacement_features.csv, physical_targets.csv, features.csv, fir_features.csv, run_report.md, extraction_status.json")
-    print(f"Excel workbook: {'fir_feature_report.xlsx' if xlsx_created else 'not created (install openpyxl)'}")
-    print("\nExtraction finished.")
+
+    print("===== Target Measurement Status =====")
+    for key, value in post["target_measurement_status"].items():
+        print(f"{key}: {value}")
+
+    print("Generated: preplacement_features.csv, physical_targets.csv, features.csv, ")
+    print("          fir_features.csv, run_report.md, extraction_status.json")
+    print(f"Excel workbook: {'fir_feature_report.xlsx' if xlsx_created else 'not created (openpyxl unavailable)'}")
     return 0
 
 if __name__ == "__main__":
