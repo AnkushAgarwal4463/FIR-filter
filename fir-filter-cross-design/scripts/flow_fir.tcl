@@ -242,15 +242,16 @@ if {[catch {has_congestion} congestion_flag]} {
 
 set report_generated 0
 
-if {[catch {report_congestion} report_result]} {
+if {[catch {
+    report_congestion > "$::env(RUN_DIR)/congestion_detail.rpt"
+} report_result]} {
 
     fir_log "WARNING: report_congestion failed: $report_result"
 
 } else {
 
     set report_generated 1
-
-    fir_log "CONGESTION_REPORT_GENERATED"
+    fir_log "CONGESTION_REPORT_GENERATED: $::env(RUN_DIR)/congestion_detail.rpt"
 }
 
 # Save congestion status.
@@ -262,6 +263,16 @@ puts $fd "GLOBAL_ROUTE_HAS_CONGESTION: $congestion_status"
 puts $fd "CONGESTION_REPORT_GENERATED: $report_generated"
 
 close $fd
+
+# Explicit global-route wirelength report (microns, as reported by OpenROAD).
+if {[catch {
+    report_wire_length -net * -global_route \
+        -file "$::env(RUN_DIR)/wirelength_global.rpt"
+} result]} {
+    fir_log "WARNING: global-route wirelength report unavailable: $result"
+} else {
+    fir_log "GLOBAL_ROUTE_WIRELENGTH_REPORT: $::env(RUN_DIR)/wirelength_global.rpt"
+}
 
 # ------------------------------------------------------------
 # 14. Global-route parasitic estimation and timing reports
@@ -305,7 +316,10 @@ fir_log "PRE_DRT_CHECKPOINTS_SAVED"
 # 16. Detailed routing
 # ------------------------------------------------------------
 
-fir_step "detailed_routing" [list detailed_route]
+set detailed_route_drc_report "$::env(RUN_DIR)/detailed_route_drc.rpt"
+
+fir_step "detailed_routing" [list detailed_route \
+    -output_drc $detailed_route_drc_report]
 
 puts "SUCCESS: Detailed routing"
 
@@ -320,6 +334,16 @@ fir_step "write_final_def" \
 
 fir_step "write_final_odb" \
     [list write_db "$::env(RUN_DIR)/final.odb"]
+
+# Detailed-route wirelength report for the final routed database.
+if {[catch {
+    report_wire_length -net * -detailed_route \
+        -file "$::env(RUN_DIR)/wirelength_detailed.rpt"
+} result]} {
+    fir_log "WARNING: detailed-route wirelength report unavailable: $result"
+} else {
+    fir_log "DETAILED_ROUTE_WIRELENGTH_REPORT: $::env(RUN_DIR)/wirelength_detailed.rpt"
+}
 
 # ------------------------------------------------------------
 # 18. Final timing and area reports
