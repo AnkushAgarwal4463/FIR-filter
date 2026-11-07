@@ -273,21 +273,66 @@ grep -E 'create_clock.*-period' "$SDC" || true
 export NETLIST NETLIST_JSON SDC RUN_DIR UTIL
 export PLACE_DENSITY ENABLE_REPAIR_TIMING
 
-if ! openroad -exit scripts/flow_fir.tcl 2>&1 \
+# ------------------------------------------------------------
+# Run OpenROAD, but do not exit immediately on routing failure.
+# The pre-DRT checkpoint may still contain useful measurements.
+# ------------------------------------------------------------
+
+OPENROAD_STATUS=0
+
+echo
+echo "Starting OpenROAD physical-design flow..."
+
+if openroad -exit scripts/flow_fir.tcl 2>&1 \
   | tee "$RUN_DIR/openroad_log.txt"; then
-  echo "ERROR: OpenROAD failed; inspect $RUN_DIR/openroad_log.txt and flow_diagnostics.log."
-  exit 4
+  echo "OpenROAD process returned success."
+else
+  OPENROAD_STATUS=$?
+  echo "WARNING: OpenROAD returned exit code $OPENROAD_STATUS."
+  echo "Continuing to feature extraction using available checkpoints."
 fi
 
-for file in "$RUN_DIR/final.def" "$RUN_DIR/final.odb"; do
-  [[ -s "$file" ]] || {
-    echo "ERROR: Required final artifact missing: $file"
-    exit 4
-  }
-done
+# ------------------------------------------------------------
+# Check which physical-design checkpoints survived.
+# Final DEF/ODB are not mandatory for partial extraction.
+# ------------------------------------------------------------
 
-# Extract netlist and physical-design features.
-python3 scripts/extract_fir_features.py \
+FINAL_DEF_PRESENT=0
+FINAL_ODB_PRESENT=0
+PRE_DRT_DEF_PRESENT=0
+PRE_DRT_ODB_PRESENT=0
+
+[[ -s "$RUN_DIR/final.def" ]] && FINAL_DEF_PRESENT=1
+[[ -s "$RUN_DIR/final.odb" ]] && FINAL_ODB_PRESENT=1
+[[ -s "$RUN_DIR/pre_drt.def" ]] && PRE_DRT_DEF_PRESENT=1
+[[ -s "$RUN_DIR/pre_drt.odb" ]] && PRE_DRT_ODB_PRESENT=1
+
+echo
+echo "Physical-design checkpoint status:"
+echo "final.def:   $FINAL_DEF_PRESENT"
+echo "final.odb:   $FINAL_ODB_PRESENT"
+echo "pre_drt.def: $PRE_DRT_DEF_PRESENT"
+echo "pre_drt.odb: $PRE_DRT_ODB_PRESENT"
+
+if (( PRE_DRT_DEF_PRESENT == 1 && PRE_DRT_ODB_PRESENT == 1 )); then
+  echo "Pre-DRT checkpoint is available."
+elif (( FINAL_DEF_PRESENT == 1 && FINAL_ODB_PRESENT == 1 )); then
+  echo "Final DEF/ODB artifacts are available."
+else
+  echo "WARNING: No complete DEF/ODB checkpoint was found."
+fi
+
+# ------------------------------------------------------------
+# Always attempt extraction after synthesis has succeeded.
+# This also runs when OpenROAD fails during detailed routing.
+# ------------------------------------------------------------
+
+EXTRACTION_STATUS=0
+
+echo
+echo "Starting FIR feature extraction..."
+
+if python3 scripts/extract_fir_features.py \
   --netlist-json "$NETLIST_JSON" \
   --run-dir "$RUN_DIR" \
   --outdir "$RUN_DIR" \
@@ -300,34 +345,71 @@ python3 scripts/extract_fir_features.py \
   --acc-width "$ACC_WIDTH" \
   --utilization "$UTIL" \
   --place-density "$PLACE_DENSITY" \
-  --clock-period "$CLK_PERIOD"
+  --clock-period "$CLK_PERIOD"; then
+  echo "Feature extraction process returned success."
+else
+  EXTRACTION_STATUS=$?
+  echo "ERROR: Feature extraction failed with exit code $EXTRACTION_STATUS."
+fi
+
+# ------------------------------------------------------------
+# Validate extraction outputs.
+# Final DEF/ODB are deliberately NOT required here.
+# ------------------------------------------------------------
 
 required_outputs=(
   configuration.json
-  final.def
-  final.odb
-  features.csv
-  physical_targets.csv
   preplacement_features.csv
+  preplacement_features.json
+  physical_targets.csv
+  physical_targets.json
+  features.csv
+  features.json
   fir_features.csv
   extraction_status.json
   run_report.md
 )
 
-missing=0
+MISSING_OUTPUTS=0
+
+echo
+echo "Checking extraction outputs..."
 
 for name in "${required_outputs[@]}"; do
   if [[ -s "$RUN_DIR/$name" ]]; then
     echo "FOUND: $RUN_DIR/$name"
   else
     echo "MISSING/EMPTY: $RUN_DIR/$name"
-    missing=$((missing + 1))
+    MISSING_OUTPUTS=$((MISSING_OUTPUTS + 1))
   fi
 done
 
-if (( missing != 0 )); then
-  echo "ERROR: $missing required extraction output(s) missing."
+if (( MISSING_OUTPUTS != 0 )); then
+  echo "ERROR: $MISSING_OUTPUTS required extraction output(s) missing."
   exit 5
 fi
 
-echo "FIR flow completed: $RUN_TAG"
+# ------------------------------------------------------------
+# Preserve the failure result for GitHub Actions.
+# The workflow can upload partial artifacts with always().
+# ------------------------------------------------------------
+
+if (( EXTRACTION_STATUS != 0 )); then
+  echo "ERROR: Extraction failed. See extraction diagnostics."
+  exit 5
+fi
+
+if (( OPENROAD_STATUS != 0 )); then
+  echo "ERROR: OpenROAD failed with exit code $OPENROAD_STATUS."
+  echo "Partial feature extraction was completed where possible."
+  exit 4
+fi
+
+if (( FINAL_DEF_PRESENT != 1 || FINAL_ODB_PRESENT != 1 )); then
+  echo "ERROR: OpenROAD returned success, but final DEF/ODB are incomplete."
+  echo "Partial extraction outputs have been preserved."
+  exit 4
+fi
+
+echo
+echo "FIR flow completed successfully: $RUN_TAG"
