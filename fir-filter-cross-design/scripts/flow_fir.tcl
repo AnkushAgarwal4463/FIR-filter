@@ -1,4 +1,3 @@
-
 # FIR physical-design flow for OpenROAD / Sky130HD.
 #
 # Required environment:
@@ -8,6 +7,10 @@
 # Optional environment:
 # RUN_TAG
 # ENABLE_REPAIR_TIMING (0 = disabled, 1 = enabled; default = 1)
+#
+# IMPORTANT DATASET POLICY:
+# Synthesized-netlist features are the only ML predictors.
+# Placement/routing measurements, including congestion, are labels/targets only.
 
 # ------------------------------------------------------------
 # 1. Validate required environment variables
@@ -23,13 +26,10 @@ foreach var {
     }
 }
 
-# Validate timing-repair switch.
 set enable_repair_timing 1
-
 if {[info exists ::env(ENABLE_REPAIR_TIMING)]} {
     set enable_repair_timing $::env(ENABLE_REPAIR_TIMING)
 }
-
 if {$enable_repair_timing ni {0 1}} {
     puts stderr "ERROR: ENABLE_REPAIR_TIMING must be 0 or 1"
     exit 1
@@ -40,7 +40,6 @@ if {$enable_repair_timing ni {0 1}} {
 # ------------------------------------------------------------
 
 file mkdir $::env(RUN_DIR)
-
 if {[info exists ::env(RUN_TAG)] && $::env(RUN_TAG) ne ""} {
     set ::fir_run_id $::env(RUN_TAG)
 } else {
@@ -69,7 +68,6 @@ proc fir_status {status stage} {
 
 proc fir_log {message} {
     puts $message
-
     set fd [open $::fir_diagnostics a]
     puts $fd $message
     close $fd
@@ -77,22 +75,18 @@ proc fir_log {message} {
 
 proc fir_step {stage command_list} {
     set ::fir_current_stage $stage
-
     fir_log "STAGE: $stage"
     fir_status "IN_PROGRESS" $::fir_last_completed_stage
 
     if {[catch {uplevel #0 $command_list} result options]} {
         fir_log "ERROR in stage '$stage': $result"
         fir_status "FAILED" $::fir_last_completed_stage
-
         return -options $options $result
     }
 
     set ::fir_last_completed_stage $stage
-
     fir_status "IN_PROGRESS" $::fir_last_completed_stage
     fir_log "STAGE_COMPLETED: $stage"
-
     return $result
 }
 
@@ -109,24 +103,19 @@ puts $fd "FIR physical-design diagnostics for $::fir_run_id"
 close $fd
 
 fir_status "STARTED" "initialization"
-
 fir_log "RUN_ID: $::fir_run_id"
 fir_log "ENABLE_REPAIR_TIMING: $enable_repair_timing"
+fir_log "ML_INPUT_POLICY: synthesized netlist features only; physical metrics are targets"
 
 # ------------------------------------------------------------
 # 5. Read technology and design
 # ------------------------------------------------------------
 
 fir_step "read_technology_lef" [list read_lef $::env(TECH_LEF)]
-
 fir_step "read_cell_lef" [list read_lef $::env(CELL_LEF)]
-
 fir_step "read_liberty" [list read_liberty $::env(LIBERTY)]
-
 fir_step "read_netlist" [list read_verilog $::env(NETLIST)]
-
 fir_step "link_design" [list link_design fir_filter]
-
 fir_step "read_sdc" [list read_sdc $::env(SDC)]
 
 # ------------------------------------------------------------
@@ -140,7 +129,6 @@ fir_step "initialize_floorplan" [list initialize_floorplan \
     -site unithd]
 
 fir_step "make_tracks" [list make_tracks]
-
 fir_step "set_wire_rc" [list set_wire_rc -layer met2]
 
 # ------------------------------------------------------------
@@ -179,89 +167,62 @@ fir_step "detailed_placement" [list detailed_placement]
 # ------------------------------------------------------------
 
 if {$enable_repair_timing == 1} {
-
     fir_log "REPAIR_TIMING_ENABLED: true"
-
-    if {[catch {
-        repair_timing -setup -setup_margin 0.2
-    } result]} {
-
+    if {[catch {repair_timing -setup -setup_margin 0.2} result]} {
         fir_log "WARNING: repair_timing was skipped/failed: $result"
-
     } else {
-
         fir_log "OPTIONAL_STEP_COMPLETED: repair_timing"
     }
-
 } else {
-
     fir_log "REPAIR_TIMING_ENABLED: false"
     fir_log "OPTIONAL_STEP_SKIPPED: repair_timing"
 }
 
 # ------------------------------------------------------------
-# 12. Global routing
+# 12. Global routing and congestion report
 # ------------------------------------------------------------
 
-set congestion_report \
-    "$::env(RUN_DIR)/congestion.rpt"
+# OpenROAD writes the detailed per-layer GRT table to its console log
+# (GRT-0096 Final congestion report). The extractor reads that table from
+# openroad_log.txt. The -congestion_report_file output is retained as an
+# additional artifact when supported by this OpenROAD build.
 
-set congestion_overflow_report \
-    "$::env(RUN_DIR)/congestion_overflow.rpt"
+set congestion_report "$::env(RUN_DIR)/congestion.rpt"
+set congestion_status_report "$::env(RUN_DIR)/congestion_status.rpt"
 
+fir_log "GLOBAL_ROUTE_CONGESTION_REPORT_REQUESTED: $congestion_report"
 fir_step "global_routing" [list global_route \
     -congestion_report_file $congestion_report \
     -verbose]
 
-# ------------------------------------------------------------
-# 13. Congestion measurement
-# ------------------------------------------------------------
-
+# has_congestion is a Boolean diagnostic only. It is NOT a numeric overflow
+# measurement and is not substituted for the GRT-0096 resource/demand table.
 if {[catch {has_congestion} congestion_flag]} {
-
     set congestion_status "unavailable"
-
     fir_log "GLOBAL_ROUTE_HAS_CONGESTION: unavailable"
-
     fir_log "WARNING: Could not query global-routing congestion: $congestion_flag"
-
 } else {
-
     set congestion_flag [expr {$congestion_flag ? 1 : 0}]
-
     if {$congestion_flag} {
         set congestion_status "true"
     } else {
         set congestion_status "false"
     }
-
     fir_log "GLOBAL_ROUTE_HAS_CONGESTION: $congestion_status"
 }
 
-# Generate detailed congestion report.
-
-set report_generated 0
-
-if {[catch {
-    report_congestion > "$::env(RUN_DIR)/congestion_detail.rpt"
-} report_result]} {
-
-    fir_log "WARNING: report_congestion failed: $report_result"
-
+set congestion_report_generated 0
+if {[file exists $congestion_report] && [file size $congestion_report] > 0} {
+    set congestion_report_generated 1
+    fir_log "CONGESTION_REPORT_GENERATED: $congestion_report"
 } else {
-
-    set report_generated 1
-    fir_log "CONGESTION_REPORT_GENERATED: $::env(RUN_DIR)/congestion_detail.rpt"
+    fir_log "CONGESTION_REPORT_FILE_UNAVAILABLE: $congestion_report"
+    fir_log "INFO: GRT-0096 table remains available in openroad_log.txt when emitted by OpenROAD"
 }
 
-# Save congestion status.
-
-set fd [open $congestion_overflow_report w]
-
+set fd [open $congestion_status_report w]
 puts $fd "GLOBAL_ROUTE_HAS_CONGESTION: $congestion_status"
-
-puts $fd "CONGESTION_REPORT_GENERATED: $report_generated"
-
+puts $fd "CONGESTION_REPORT_GENERATED: $congestion_report_generated"
 close $fd
 
 # Explicit global-route wirelength report (microns, as reported by OpenROAD).
@@ -275,67 +236,52 @@ if {[catch {
 }
 
 # ------------------------------------------------------------
-# 14. Global-route parasitic estimation and timing reports
+# 13. Global-route parasitic estimation and timing reports
 # ------------------------------------------------------------
 
 fir_step "estimate_global_route_parasitics" \
     [list estimate_parasitics -global_routing]
 
 catch {
-    report_checks \
-        -path_delay max \
-        -format full_clock_expanded \
+    report_checks -path_delay max -format full_clock_expanded \
         > "$::env(RUN_DIR)/timing_setup_global_route.rpt"
 }
-
 catch {
-    report_worst_slack -max \
-        > "$::env(RUN_DIR)/wns_setup_global_route.rpt"
+    report_worst_slack -max > "$::env(RUN_DIR)/wns_setup_global_route.rpt"
 }
-
 catch {
-    report_tns \
-        > "$::env(RUN_DIR)/tns_setup_global_route.rpt"
+    report_tns > "$::env(RUN_DIR)/tns_setup_global_route.rpt"
 }
 
 # ------------------------------------------------------------
-# 15. Save pre-detailed-routing checkpoints
+# 14. Save pre-detailed-routing checkpoints
 # ------------------------------------------------------------
 
-# These checkpoints remain available even if detailed routing fails.
+# These are preserved before detailed routing so that a DRT failure does not
+# destroy the placement/global-routing results or the congestion labels.
 
-fir_step "write_pre_drt_odb" \
-    [list write_db "$::env(RUN_DIR)/pre_drt.odb"]
-
-fir_step "write_pre_drt_def" \
-    [list write_def "$::env(RUN_DIR)/pre_drt.def"]
-
+fir_step "write_pre_drt_odb" [list write_db "$::env(RUN_DIR)/pre_drt.odb"]
+fir_step "write_pre_drt_def" [list write_def "$::env(RUN_DIR)/pre_drt.def"]
 fir_log "PRE_DRT_CHECKPOINTS_SAVED"
 
 # ------------------------------------------------------------
-# 16. Detailed routing
+# 15. Detailed routing
 # ------------------------------------------------------------
 
 set detailed_route_drc_report "$::env(RUN_DIR)/detailed_route_drc.rpt"
-
 fir_step "detailed_routing" [list detailed_route \
     -output_drc $detailed_route_drc_report]
 
 puts "SUCCESS: Detailed routing"
-
 fir_log "SUCCESS: Detailed routing"
 
 # ------------------------------------------------------------
-# 17. Save final routed artifacts
+# 16. Save final routed artifacts
 # ------------------------------------------------------------
 
-fir_step "write_final_def" \
-    [list write_def "$::env(RUN_DIR)/final.def"]
+fir_step "write_final_def" [list write_def "$::env(RUN_DIR)/final.def"]
+fir_step "write_final_odb" [list write_db "$::env(RUN_DIR)/final.odb"]
 
-fir_step "write_final_odb" \
-    [list write_db "$::env(RUN_DIR)/final.odb"]
-
-# Detailed-route wirelength report for the final routed database.
 if {[catch {
     report_wire_length -net * -detailed_route \
         -file "$::env(RUN_DIR)/wirelength_detailed.rpt"
@@ -346,91 +292,57 @@ if {[catch {
 }
 
 # ------------------------------------------------------------
-# 18. Final timing and area reports
+# 17. Final timing and area reports
 # ------------------------------------------------------------
 
 if {[catch {
-    report_checks \
-        -path_delay max \
-        -format full_clock_expanded \
+    report_checks -path_delay max -format full_clock_expanded \
         > "$::env(RUN_DIR)/timing_setup.rpt"
 } result]} {
     fir_log "WARNING: setup timing report unavailable: $result"
 }
 
 if {[catch {
-    report_checks \
-        -path_delay min \
-        -format full_clock_expanded \
+    report_checks -path_delay min -format full_clock_expanded \
         > "$::env(RUN_DIR)/timing_hold.rpt"
 } result]} {
     fir_log "WARNING: hold timing report unavailable: $result"
 }
 
-if {[catch {
-    report_worst_slack -max \
-        > "$::env(RUN_DIR)/wns_setup.rpt"
-} result]} {
+if {[catch {report_worst_slack -max > "$::env(RUN_DIR)/wns_setup.rpt"} result]} {
     fir_log "WARNING: setup WNS report unavailable: $result"
 }
-
-if {[catch {
-    report_worst_slack -min \
-        > "$::env(RUN_DIR)/wns_hold.rpt"
-} result]} {
+if {[catch {report_worst_slack -min > "$::env(RUN_DIR)/wns_hold.rpt"} result]} {
     fir_log "WARNING: hold WNS report unavailable: $result"
 }
-
-if {[catch {
-    report_tns \
-        > "$::env(RUN_DIR)/tns_setup.rpt"
-} result]} {
+if {[catch {report_tns > "$::env(RUN_DIR)/tns_setup.rpt"} result]} {
     fir_log "WARNING: TNS report unavailable: $result"
 }
-
-if {[catch {
-    report_design_area \
-        > "$::env(RUN_DIR)/design_area.rpt"
-} result]} {
+if {[catch {report_design_area > "$::env(RUN_DIR)/design_area.rpt"} result]} {
     fir_log "WARNING: design-area report unavailable: $result"
 }
 
 # ------------------------------------------------------------
-# 19. Validate final routed artifacts
+# 18. Validate final routed artifacts
 # ------------------------------------------------------------
 
-if {
-    ![file exists "$::env(RUN_DIR)/final.def"] ||
-    [file size "$::env(RUN_DIR)/final.def"] == 0
-} {
-
+if {![file exists "$::env(RUN_DIR)/final.def"] || [file size "$::env(RUN_DIR)/final.def"] == 0} {
     fir_log "ERROR: final.def is missing or empty"
-
     fir_status "FAILED" $::fir_last_completed_stage
-
     error "final.def is missing or empty"
 }
 
-if {
-    ![file exists "$::env(RUN_DIR)/final.odb"] ||
-    [file size "$::env(RUN_DIR)/final.odb"] == 0
-} {
-
+if {![file exists "$::env(RUN_DIR)/final.odb"] || [file size "$::env(RUN_DIR)/final.odb"] == 0} {
     fir_log "ERROR: final.odb is missing or empty"
-
     fir_status "FAILED" $::fir_last_completed_stage
-
     error "final.odb is missing or empty"
 }
 
 # ------------------------------------------------------------
-# 20. Mark flow as completed
+# 19. Mark flow as completed
 # ------------------------------------------------------------
 
 set ::fir_last_completed_stage "flow_completed"
-
 fir_status "COMPLETED" $::fir_last_completed_stage
-
 fir_log "FLOW_COMPLETED: $::env(RUN_DIR)"
-
 puts "FIR physical-design flow completed. Results: $::env(RUN_DIR)"
