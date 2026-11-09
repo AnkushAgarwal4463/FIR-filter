@@ -482,60 +482,75 @@ def parse_route_log(text: str) -> dict[str, Any]:
 
 
 
-def parse_congestion_metrics(text: str) -> dict[str, float | None]:
-    """Parse explicit global-routing overflow metrics from one GRT source.
-
-    The final Total row in OpenROAD's congestion table contains the maximum
-    horizontal, maximum vertical, and total overflow values. A Boolean status
-    or a generic mention of congestion is never converted into a numeric zero.
-    """
-    result: dict[str, float | None] = {
-        "congestion_max_horizontal_overflow": None,
-        "congestion_max_vertical_overflow": None,
-        "congestion_overflow": None,
+def empty_grt_metrics() -> dict[str, float | None]:
+    """Return the stable set of global-routing congestion target fields."""
+    metrics: dict[str, float | None] = {
+        "grt_total_resource": None,
+        "grt_total_demand": None,
+        "grt_usage_percent": None,
+        "grt_max_horizontal_congestion": None,
+        "grt_max_vertical_congestion": None,
+        "grt_total_congestion": None,
     }
+    for layer in ("li1", "met1", "met2", "met3", "met4", "met5"):
+        for suffix in (
+            "resource", "demand", "usage_percent",
+            "max_horizontal_congestion", "max_vertical_congestion",
+            "total_congestion",
+        ):
+            metrics[f"grt_{layer}_{suffix}"] = None
+    return metrics
+
+
+def parse_congestion_metrics(text: str) -> dict[str, float | None]:
+    """Parse OpenROAD GRT-0096 resource/demand/usage/congestion table.
+
+    The final three columns are explicitly labelled Max H / Max V / Total
+    Congestion. They are not overflow metrics and are never renamed as such.
+    """
+    result = empty_grt_metrics()
     if not text or not text.strip():
         return result
 
-    # OpenROAD verbose GRT table: Total <...> <...>% <max-H> / <max-V> / <total>.
-    table_rows = re.findall(
-        rf"(?im)^\s*Total\s+{NUM}\s+{NUM}\s+{NUM}%\s+({NUM})\s*/\s*({NUM})\s*/\s*({NUM})\s*$",
-        text,
+    # Limit parsing to the final congestion table when the standard header is
+    # present. This avoids accidentally consuming unrelated numeric log lines.
+    header = re.search(r"(?im)^.*Final congestion report:\s*$", text)
+    table_text = text[header.end():] if header else text
+    row_re = re.compile(
+        rf"(?im)^\s*(li1|met[1-5]|Total)\s+({NUM})\s+({NUM})\s+({NUM})%\s+({NUM})\s*/\s*({NUM})\s*/\s*({NUM})\s*$"
     )
-    if table_rows:
-        h, v, total = table_rows[-1]
-        result.update({
-            "congestion_max_horizontal_overflow": finite_float(h),
-            "congestion_max_vertical_overflow": finite_float(v),
-            "congestion_overflow": finite_float(total),
-        })
-        return result
-
-    # Some flow scripts write named scalar values to a dedicated GRT report.
-    named_patterns = {
-        "congestion_max_horizontal_overflow": [
-            rf"(?im)^\s*(?:max(?:imum)?\s+)?horizontal\s+(?:routing\s+)?overflow\s*[:=]\s*({NUM})\s*$",
-            rf"(?im)^\s*max\s+H\s+overflow\s*[:=]\s*({NUM})\s*$",
-        ],
-        "congestion_max_vertical_overflow": [
-            rf"(?im)^\s*(?:max(?:imum)?\s+)?vertical\s+(?:routing\s+)?overflow\s*[:=]\s*({NUM})\s*$",
-            rf"(?im)^\s*max\s+V\s+overflow\s*[:=]\s*({NUM})\s*$",
-        ],
-        "congestion_overflow": [
-            rf"(?im)^\s*(?:total\s+)?(?:global\s+)?routing\s+overflow\s*[:=]\s*({NUM})\s*$",
-            rf"(?im)^\s*total\s+congestion\s+overflow\s*[:=]\s*({NUM})\s*$",
-            rf"(?im)^\s*total\s+overflow\s*[:=]\s*({NUM})\s*$",
-        ],
-    }
-    for key, patterns in named_patterns.items():
-        result[key] = last_number(text, patterns)
-
-    return result
+    found_total = False
+    for match in row_re.finditer(table_text):
+        layer = match.group(1).lower()
+        values = [finite_float(match.group(i)) for i in range(2, 8)]
+        if any(value is None for value in values):
+            continue
+        resource, demand, usage, max_h, max_v, total = values
+        if layer == "total":
+            result.update({
+                "grt_total_resource": resource,
+                "grt_total_demand": demand,
+                "grt_usage_percent": usage,
+                "grt_max_horizontal_congestion": max_h,
+                "grt_max_vertical_congestion": max_v,
+                "grt_total_congestion": total,
+            })
+            found_total = True
+        else:
+            result.update({
+                f"grt_{layer}_resource": resource,
+                f"grt_{layer}_demand": demand,
+                f"grt_{layer}_usage_percent": usage,
+                f"grt_{layer}_max_horizontal_congestion": max_h,
+                f"grt_{layer}_max_vertical_congestion": max_v,
+                f"grt_{layer}_total_congestion": total,
+            })
+    return result if found_total else empty_grt_metrics()
 
 
 def parse_congestion(text: str) -> float | None:
-    """Backward-compatible accessor for the total GRT overflow only."""
-    return parse_congestion_metrics(text)["congestion_overflow"]
+    """Compatibility accessor: returns GRT total congestion, not overflow."""
+    return parse_congestion_metrics(text)["grt_total_congestion"]
 
 
 def parse_congestion_status(text: str) -> str | None:
@@ -552,38 +567,38 @@ def parse_congestion_status(text: str) -> str | None:
 
 
 def find_global_route_source(run_dir: Path, logs: dict[str, str]) -> tuple[str | None, str, dict[str, float | None]]:
-    """Select a named GRT report/log; never parse an arbitrary combined log."""
+    """Find a real GRT table, including the table embedded in openroad_log.txt."""
     report_names = (
-        "global_route_congestion.rpt", "grt_congestion.rpt",
-        "congestion.rpt", "routing_congestion.rpt",
+        "congestion.rpt", "global_route_congestion.rpt", "grt_congestion.rpt",
+        "routing_congestion.rpt",
     )
+    seen: set[Path] = set()
     for wanted in report_names:
-        candidates = [run_dir / wanted, *sorted(run_dir.rglob(wanted))]
-        for path in candidates:
-            if not path.is_file():
+        for path in [run_dir / wanted, *sorted(run_dir.rglob(wanted))]:
+            if path in seen or not path.is_file():
                 continue
+            seen.add(path)
             content = read_text(path)
             metrics = parse_congestion_metrics(content)
-            if metrics["congestion_overflow"] is not None:
+            if metrics["grt_total_resource"] is not None:
                 return str(path), content, metrics
 
-    # Only stage-specific global-routing logs are eligible for numeric parsing.
-    grt_names = {
-        "5_1_grt.log", "global_route.log", "global_routing.log",
-        "global_route_congestion.log", "grt.log",
-    }
+    # The standard OpenROAD Tcl runner writes GRT-0096 into openroad_log.txt.
+    # Parse only this log and only when the explicit table header is present.
     for name, content in logs.items():
-        if Path(name).name.lower() not in grt_names:
+        base = Path(name).name.lower()
+        if base != "openroad_log.txt" and base not in {
+            "5_1_grt.log", "global_route.log", "global_routing.log",
+            "global_route_congestion.log", "grt.log",
+        }:
+            continue
+        if not re.search(r"(?im)^.*Final congestion report:", content):
             continue
         metrics = parse_congestion_metrics(content)
-        if metrics["congestion_overflow"] is not None:
-            return name, content, metrics
+        if metrics["grt_total_resource"] is not None:
+            return f"{name} (GRT-0096 Final congestion report)", content, metrics
 
-    return None, "", {
-        "congestion_max_horizontal_overflow": None,
-        "congestion_max_vertical_overflow": None,
-        "congestion_overflow": None,
-    }
+    return None, "", empty_grt_metrics()
 
 
 def parse_physical_log_values(text: str) -> dict[str, Any]:
@@ -703,11 +718,12 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
     congestion_source, congestion_text, congestion_metrics = find_global_route_source(run_dir, logs)
     # The Tcl status report is a Boolean only; do not use detailed-route or
     # unrelated logs to infer global-route status.
-    status_path = run_dir / "congestion_overflow.rpt"
+    status_path = run_dir / "congestion_status.rpt"
+    if not status_path.is_file():
+        status_path = run_dir / "congestion_overflow.rpt"  # legacy status filename
     congestion_status = parse_congestion_status(read_text(status_path))
     if congestion_status is None:
         congestion_status = parse_congestion_status(congestion_text)
-    congestion = congestion_metrics["congestion_overflow"]
 
     # Parse each timing metric independently.
     # Do not use one generic timing parser for setup and hold.
@@ -783,9 +799,8 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "wns_setup_ns": "measured" if wns_setup is not None else "unavailable",
         "tns_setup_ns": "measured" if tns_setup is not None else "unavailable",
         "wns_hold_ns": "measured" if wns_hold is not None else "unavailable",
-        "congestion_overflow": "measured" if congestion is not None else "unavailable",
-        "congestion_max_horizontal_overflow": "measured" if congestion_metrics["congestion_max_horizontal_overflow"] is not None else "unavailable",
-        "congestion_max_vertical_overflow": "measured" if congestion_metrics["congestion_max_vertical_overflow"] is not None else "unavailable",
+        **{key: ("measured" if value is not None else "unavailable")
+           for key, value in congestion_metrics.items()},
         "congestion_status": "measured" if congestion_status is not None else "unavailable",
         "wirelength_um": "measured" if route["wirelength_um"] is not None else "unavailable",
         "via_count": "measured" if route["via_count"] is not None else "unavailable",
@@ -810,9 +825,7 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "wns_setup_ns": wns_setup,
         "tns_setup_ns": tns_setup,
         "wns_hold_ns": wns_hold,
-        "congestion_overflow": congestion,
-        "congestion_max_horizontal_overflow": congestion_metrics["congestion_max_horizontal_overflow"],
-        "congestion_max_vertical_overflow": congestion_metrics["congestion_max_vertical_overflow"],
+        **congestion_metrics,
         "congestion_status": congestion_status,
         "setup_report_source": str(setup_path) if setup_path else ("logs" if setup_src else None),
         "tns_report_source": str(tns_path) if tns_path else ("logs" if tns_src else None),
@@ -824,7 +837,7 @@ def physical_features(run_dir: Path) -> dict[str, Any]:
         "note": (
             "DEF route counts are approximate. Cell classes are heuristic and should be validated against Liberty. "
             "Fanout uses Yosys directions with Liberty fallback. Congestion is extracted only from a dedicated "
-            "global-routing report/log; missing overflow is unavailable, not zero, and H/V maxima are kept separately. "
+            "global-routing report/log; resource, demand, usage and congestion are stored as physical targets, not predictors. "
             "Effective density is measured from placed LEF macro "
             "area divided by DEF placement-row area when geometry is available. Router violations are not independent signoff DRC."
         ),
@@ -928,9 +941,12 @@ DISPLAY_NAMES = {
     "design_area_um2": "Design area (µm²)",
     "wns_setup_ns": "Setup WNS (ns)", "tns_setup_ns": "Setup TNS (ns)",
     "wns_hold_ns": "Hold WNS (ns)",
-    "congestion_overflow": "Global-route total overflow",
-    "congestion_max_horizontal_overflow": "Global-route max horizontal overflow",
-    "congestion_max_vertical_overflow": "Global-route max vertical overflow",
+    "grt_total_resource": "GRT total routing resources",
+    "grt_total_demand": "GRT total routing demand",
+    "grt_usage_percent": "GRT total resource usage (%)",
+    "grt_max_horizontal_congestion": "GRT maximum horizontal congestion",
+    "grt_max_vertical_congestion": "GRT maximum vertical congestion",
+    "grt_total_congestion": "GRT total congestion",
     "congestion_status": "Global-route congestion status",
     "setup_report_source": "Setup timing report source", "tns_report_source": "TNS report source",
     "hold_report_source": "Hold timing report source", "congestion_report_source": "Congestion report source",
@@ -941,6 +957,17 @@ DISPLAY_NAMES = {
     "place_density": "Placement density", "clk_period_ns": "Clock period (ns)",
     "flow_status": "Flow status", "last_completed_stage": "Last completed stage",
 }
+
+for _layer in ("li1", "met1", "met2", "met3", "met4", "met5"):
+    DISPLAY_NAMES.update({
+        f"grt_{_layer}_resource": f"{_layer} routing resources",
+        f"grt_{_layer}_demand": f"{_layer} routing demand",
+        f"grt_{_layer}_usage_percent": f"{_layer} resource usage (%)",
+        f"grt_{_layer}_max_horizontal_congestion": f"{_layer} max horizontal congestion",
+        f"grt_{_layer}_max_vertical_congestion": f"{_layer} max vertical congestion",
+        f"grt_{_layer}_total_congestion": f"{_layer} total congestion",
+    })
+
 
 
 def display_value(value: Any) -> str:
@@ -994,8 +1021,8 @@ def write_human_report(outdir: Path, pre: dict[str, Any], post: dict[str, Any], 
         "detailed_route_success_marker_found", "routed_net_count", "route_segment_count", "wirelength_um",
         "via_count", "final_detailed_route_violations", "effective_place_density",
         "effective_place_density_method", "placed_cell_area_from_def_um2", "placement_row_area_um2",
-        "design_area_um2", "wns_setup_ns", "tns_setup_ns", "wns_hold_ns", "congestion_overflow",
-        "congestion_max_horizontal_overflow", "congestion_max_vertical_overflow", "congestion_status",
+        "design_area_um2", "wns_setup_ns", "tns_setup_ns", "wns_hold_ns",
+        *empty_grt_metrics().keys(), "congestion_status",
     ]
     synthesis_keys = [
         "cell_count", "netname_count", "port_count", "port_bit_count", "sequential_cell_count",
@@ -1273,8 +1300,9 @@ def main() -> int:
 
     print("===== Physical Targets =====")
     for key in (
-        "wns_setup_ns", "tns_setup_ns", "wns_hold_ns", "congestion_overflow",
-        "congestion_max_horizontal_overflow", "congestion_max_vertical_overflow",
+        "wns_setup_ns", "tns_setup_ns", "wns_hold_ns",
+        "grt_total_resource", "grt_total_demand", "grt_usage_percent",
+        "grt_max_horizontal_congestion", "grt_max_vertical_congestion", "grt_total_congestion",
         "wirelength_um", "via_count", "final_detailed_route_violations",
         "design_area_um2", "effective_place_density",
     ):
